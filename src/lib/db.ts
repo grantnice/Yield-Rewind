@@ -29,6 +29,43 @@ db.pragma('synchronous = NORMAL');
 db.pragma('cache_size = -64000'); // 64MB cache
 db.pragma('temp_store = MEMORY');
 
+// Migration: Add product_class column if it doesn't exist (for existing databases)
+// Must run BEFORE initSchema to avoid CREATE INDEX errors
+try {
+  db.exec(`ALTER TABLE yield_data ADD COLUMN product_class TEXT`);
+} catch {
+  // Column already exists or table doesn't exist yet, ignore
+}
+
+// Migration: Add rate columns to yield_targets if they don't exist
+try {
+  db.exec(`ALTER TABLE yield_targets ADD COLUMN monthly_plan_rate REAL`);
+} catch {
+  // Column already exists or table doesn't exist yet, ignore
+}
+try {
+  db.exec(`ALTER TABLE yield_targets ADD COLUMN business_plan_rate REAL`);
+} catch {
+  // Column already exists or table doesn't exist yet, ignore
+}
+
+// Migration: Add new tank volume columns (hc_volume, h2o_volume, total_volume)
+try {
+  db.exec(`ALTER TABLE tank_data ADD COLUMN hc_volume REAL`);
+} catch {
+  // Column already exists, ignore
+}
+try {
+  db.exec(`ALTER TABLE tank_data ADD COLUMN h2o_volume REAL`);
+} catch {
+  // Column already exists, ignore
+}
+try {
+  db.exec(`ALTER TABLE tank_data ADD COLUMN total_volume REAL`);
+} catch {
+  // Column already exists, ignore
+}
+
 // Initialize schema if needed
 const initSchema = () => {
   db.exec(`
@@ -37,6 +74,7 @@ const initSchema = () => {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       date DATE NOT NULL,
       product_name TEXT NOT NULL,
+      product_class TEXT,
       oi_qty REAL,
       rec_qty REAL,
       ship_qty REAL,
@@ -50,6 +88,7 @@ const initSchema = () => {
     CREATE INDEX IF NOT EXISTS idx_yield_date ON yield_data(date);
     CREATE INDEX IF NOT EXISTS idx_yield_product ON yield_data(product_name);
     CREATE INDEX IF NOT EXISTS idx_yield_date_product ON yield_data(date, product_name);
+    CREATE INDEX IF NOT EXISTS idx_yield_class ON yield_data(product_class);
 
     -- Sales Data Table
     CREATE TABLE IF NOT EXISTS sales_data (
@@ -131,6 +170,23 @@ const initSchema = () => {
       preference_value TEXT,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Yield Targets Table (bucket-based targets by month)
+    CREATE TABLE IF NOT EXISTS yield_targets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bucket_name TEXT NOT NULL,
+      month TEXT NOT NULL,
+      monthly_plan_target REAL,
+      business_plan_target REAL,
+      monthly_plan_rate REAL,
+      business_plan_rate REAL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(bucket_name, month)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_yield_targets_month ON yield_targets(month);
+    CREATE INDEX IF NOT EXISTS idx_yield_targets_bucket ON yield_targets(bucket_name);
   `);
 };
 

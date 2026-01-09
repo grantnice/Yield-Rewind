@@ -9,7 +9,7 @@ export async function GET(request: NextRequest) {
     const startDate = searchParams.get('start_date');
     const endDate = searchParams.get('end_date');
     const tankIdsParam = searchParams.get('tank_ids');
-    const productType = searchParams.get('product_type') as 'WATER' | 'HC' | 'ALL' | null;
+    const volumeType = searchParams.get('volume_type') as 'WATER' | 'HC' | 'ALL' | null;
 
     if (!startDate || !endDate) {
       return NextResponse.json(
@@ -21,7 +21,7 @@ export async function GET(request: NextRequest) {
     const tankIds = tankIdsParam ? tankIdsParam.split(',') : undefined;
 
     // Fetch data from SQLite
-    const data = getTankData(startDate, endDate, tankIds, productType || 'ALL');
+    const data = getTankData(startDate, endDate, tankIds, volumeType || 'ALL');
 
     const queryTimeMs = performance.now() - startTime;
 

@@ -15,6 +15,7 @@ export interface YieldDataRow {
   id: number;
   date: string;
   product_name: string;
+  product_class: string | null; // 'F' = Feedstock, 'P' = Product
   oi_qty: number | null;
   rec_qty: number | null;
   ship_qty: number | null;
@@ -31,7 +32,7 @@ export function getYieldData(
   if (products && products.length > 0) {
     const placeholders = products.map(() => '?').join(',');
     const stmt = db.prepare(`
-      SELECT id, date, product_name, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty
+      SELECT id, date, product_name, product_class, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty
       FROM yield_data
       WHERE date BETWEEN ? AND ?
         AND product_name IN (${placeholders})
@@ -41,7 +42,7 @@ export function getYieldData(
   }
 
   const stmt = db.prepare(`
-    SELECT id, date, product_name, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty
+    SELECT id, date, product_name, product_class, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty
     FROM yield_data
     WHERE date BETWEEN ? AND ?
     ORDER BY date DESC, product_name ASC
@@ -139,18 +140,22 @@ export interface TankDataRow {
   date: string;
   tank_name: string;
   product_name: string | null;
-  product_type: string | null;
-  volume: number | null;
+  hc_volume: number | null;
+  h2o_volume: number | null;
+  total_volume: number | null;
 }
 
 export function getTankData(
   startDate: string,
   endDate: string,
   tankIds?: string[],
-  productType?: 'WATER' | 'HC' | 'ALL'
+  volumeType?: 'WATER' | 'HC' | 'ALL'
 ): TankDataRow[] {
+  // Select the appropriate volume column based on volumeType
+  let volumeSelect = 'hc_volume, h2o_volume, total_volume';
+
   let query = `
-    SELECT id, date, tank_name, product_name, product_type, volume
+    SELECT id, date, tank_name, product_name, ${volumeSelect}
     FROM tank_data
     WHERE date BETWEEN ? AND ?
   `;
@@ -162,9 +167,11 @@ export function getTankData(
     params.push(...tankIds);
   }
 
-  if (productType && productType !== 'ALL') {
-    query += ' AND product_type = ?';
-    params.push(productType);
+  // Filter out rows with zero volume based on type
+  if (volumeType === 'HC') {
+    query += ' AND hc_volume > 0';
+  } else if (volumeType === 'WATER') {
+    query += ' AND h2o_volume > 0';
   }
 
   query += ' ORDER BY date ASC, tank_name ASC';

@@ -1,81 +1,95 @@
 'use client';
 
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { TimeSeriesChart } from '@/components/charts/time-series-chart';
-import { TrendingUp, TrendingDown, BarChart3, Droplets } from 'lucide-react';
-import { getDaysAgo, getYesterday, formatNumber } from '@/lib/utils';
-
-interface QuickMetric {
-  title: string;
-  value: string;
-  change?: number;
-  icon: React.ElementType;
-}
+import { TrendingUp, Fuel, Flame, AlertTriangle } from 'lucide-react';
+import { getMonthStart, getYesterday, formatNumber } from '@/lib/utils';
 
 export default function Dashboard() {
-  // Fetch yesterday's yield data for quick metrics
-  const { data: yieldData, isLoading: yieldLoading } = useQuery({
-    queryKey: ['dashboard-yield'],
+  // Get MTD date range
+  const mtdStart = getMonthStart();
+  const mtdEnd = getYesterday();
+
+  // Fetch MTD yield data
+  const { data: yieldData, isLoading } = useQuery({
+    queryKey: ['dashboard-mtd-yield', mtdStart, mtdEnd],
     queryFn: async () => {
       const res = await fetch(
-        `/api/yield?start_date=${getDaysAgo(7)}&end_date=${getYesterday()}&include_stats=true`
+        `/api/yield?start_date=${mtdStart}&end_date=${mtdEnd}&include_stats=true`
       );
       if (!res.ok) throw new Error('Failed to fetch yield data');
       return res.json();
     },
   });
 
-  // Fetch recent sales data
-  const { data: salesData, isLoading: salesLoading } = useQuery({
-    queryKey: ['dashboard-sales'],
+  // Fetch bucket configs for Distillate
+  const { data: bucketsData } = useQuery({
+    queryKey: ['buckets', 'yield'],
     queryFn: async () => {
-      const res = await fetch(
-        `/api/sales?start_date=${getDaysAgo(7)}&end_date=${getYesterday()}&include_stats=true`
-      );
-      if (!res.ok) throw new Error('Failed to fetch sales data');
+      const res = await fetch('/api/buckets?type=yield');
+      if (!res.ok) throw new Error('Failed to fetch buckets');
       return res.json();
     },
   });
 
-  const loading = yieldLoading || salesLoading;
+  // Calculate MTD metrics (average daily values)
+  const mtdMetrics = useMemo(() => {
+    if (!yieldData?.data) return null;
 
-  // Process quick metrics
-  const metrics: QuickMetric[] = [
-    {
-      title: 'Yield Records',
-      value: loading ? '...' : formatNumber(yieldData?.meta?.record_count || 0, 0),
-      icon: TrendingUp,
-    },
-    {
-      title: 'Sales Records',
-      value: loading ? '...' : formatNumber(salesData?.meta?.record_count || 0, 0),
-      icon: BarChart3,
-    },
-    {
-      title: 'Query Time (Yield)',
-      value: loading ? '...' : `${yieldData?.meta?.query_time_ms || 0}ms`,
-      icon: TrendingDown,
-    },
-    {
-      title: 'Query Time (Sales)',
-      value: loading ? '...' : `${salesData?.meta?.query_time_ms || 0}ms`,
-      icon: Droplets,
-    },
-  ];
+    // Get unique dates to count days
+    const uniqueDates = new Set<string>();
 
-  // Prepare chart data (aggregate by date for all products)
-  const chartData = yieldData?.data
-    ? Object.values(
-        yieldData.data.reduce((acc: Record<string, any>, row: any) => {
-          if (!acc[row.date]) {
-            acc[row.date] = { date: row.date, total_yield: 0 };
-          }
-          acc[row.date].total_yield += row.yield_qty || 0;
-          return acc;
-        }, {})
-      ).sort((a: any, b: any) => a.date.localeCompare(b.date))
-    : [];
+    // Sum by product class and date
+    const dailyCrude: Record<string, number> = {};
+    const dailyNonCrude: Record<string, number> = {};
+    const productYields: Record<string, number> = {};
+
+    yieldData.data.forEach((row: any) => {
+      const yieldQty = row.yield_qty || 0;
+      uniqueDates.add(row.date);
+      productYields[row.product_name] = (productYields[row.product_name] || 0) + yieldQty;
+
+      if (row.product_class === 'F') {
+        dailyCrude[row.date] = (dailyCrude[row.date] || 0) + yieldQty;
+      } else if (row.product_class === 'P') {
+        dailyNonCrude[row.date] = (dailyNonCrude[row.date] || 0) + yieldQty;
+      }
+    });
+
+    const numDays = uniqueDates.size || 1;
+
+    // Calculate totals
+    const crudeRateTotal = Object.values(dailyCrude).reduce((a, b) => a + b, 0);
+    const nonCrudeTotal = Object.values(dailyNonCrude).reduce((a, b) => a + b, 0);
+
+    // Negate crude rate for display (feed consumption shows positive)
+    const avgCrudeRate = -crudeRateTotal / numDays;
+    const avgNonCrude = nonCrudeTotal / numDays;
+    const avgLoss = avgCrudeRate - avgNonCrude;
+
+    // Calculate Distillate from bucket
+    let distillateTotal = 0;
+    const distillateBucket = bucketsData?.buckets?.find((b: any) => b.bucket_name === 'Distillate');
+    if (distillateBucket) {
+      distillateTotal = distillateBucket.component_products.reduce(
+        (sum: number, prod: string) => sum + (productYields[prod] || 0),
+        0
+      );
+    }
+    const avgDistillate = distillateTotal / numDays;
+
+    return {
+      crudeRate: avgCrudeRate,
+      distillate: avgDistillate,
+      loss: avgLoss,
+      lossPercent: avgCrudeRate !== 0 ? (avgLoss / avgCrudeRate) * 100 : 0,
+      numDays,
+    };
+  }, [yieldData, bucketsData]);
+
+  // Get current month name
+  const currentMonth = new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
 
   return (
     <div className="space-y-6">
@@ -87,49 +101,64 @@ export default function Dashboard() {
         </p>
       </div>
 
-      {/* Quick Metrics */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {metrics.map((metric) => (
-          <Card key={metric.title}>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium text-gray-500">
-                {metric.title}
-              </CardTitle>
-              <metric.icon className="h-4 w-4 text-gray-400" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{metric.value}</div>
-            </CardContent>
-          </Card>
-        ))}
+      {/* MTD Summary Header */}
+      <div className="text-lg font-semibold text-gray-700">
+        MTD Average Daily: {currentMonth}
+        {mtdMetrics && <span className="text-sm font-normal text-gray-500 ml-2">({mtdMetrics.numDays} days)</span>}
       </div>
 
-      {/* Trend Chart */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Last 7 Days - Total Yield Trend</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {loading ? (
-            <div className="h-[300px] flex items-center justify-center bg-gray-50 rounded-lg">
-              <p className="text-gray-500">Loading chart...</p>
+      {/* MTD Metrics */}
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium text-gray-500">
+              Avg Daily Crude Rate
+            </CardTitle>
+            <Fuel className="h-4 w-4 text-gray-400" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">
+              {isLoading ? '...' : formatNumber(mtdMetrics?.crudeRate || 0, 0)}
             </div>
-          ) : chartData.length > 0 ? (
-            <TimeSeriesChart
-              data={chartData as any[]}
-              seriesKeys={['total_yield']}
-              seriesLabels={{ total_yield: 'Total Yield' }}
-              height={300}
-              showDataZoom={false}
-              chartType="area"
-            />
-          ) : (
-            <div className="h-[300px] flex items-center justify-center bg-gray-50 rounded-lg">
-              <p className="text-gray-500">No data available. Run a sync to load data.</p>
+            <p className="text-xs text-gray-500 mt-1">barrels/day</p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium text-gray-500">
+              Avg Daily Distillate
+            </CardTitle>
+            <Flame className="h-4 w-4 text-gray-400" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">
+              {isLoading ? '...' : formatNumber(mtdMetrics?.distillate || 0, 0)}
             </div>
-          )}
-        </CardContent>
-      </Card>
+            <p className="text-xs text-gray-500 mt-1">
+              barrels/day
+              {!isLoading && mtdMetrics?.crudeRate ? ` (${((mtdMetrics.distillate / mtdMetrics.crudeRate) * 100).toFixed(1)}%)` : ''}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium text-gray-500">
+              Avg Daily Loss
+            </CardTitle>
+            <AlertTriangle className="h-4 w-4 text-gray-400" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">
+              {isLoading ? '...' : formatNumber(mtdMetrics?.loss || 0, 0)}
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              {isLoading ? '' : `${mtdMetrics?.lossPercent?.toFixed(1)}% of crude`}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
 
       {/* Performance Notice */}
       <Card className="bg-blue-50 border-blue-200">

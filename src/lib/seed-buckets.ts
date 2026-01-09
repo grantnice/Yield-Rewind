@@ -8,72 +8,93 @@
 import { saveBucketConfig, getBucketConfigs } from './queries';
 
 // Default Yield Buckets
+// Special syntax: __CLASS:X aggregates all products with product_class = X
+// __CALC:LOSS is calculated as Crude Rate - Non-Crude Total
 const YIELD_BUCKETS = [
   {
     bucket_type: 'yield' as const,
+    bucket_name: 'Crude Rate',
+    component_products: ['__CLASS:F'],  // All Feedstock (crude) products
+    is_virtual: false,
+    display_order: 0,
+  },
+  {
+    bucket_type: 'yield' as const,
     bucket_name: 'LPG',
-    component_products: ['COMLPG', 'I-BUTANE', 'MOBPROP', 'N-BUTANE', 'PRO stenched'],
+    component_products: ['COMLPG', 'I-BUTANE', 'MOBPROP', 'N-BUTANE', 'PRO stenched', 'COMM PROPANE'],
     is_virtual: false,
     display_order: 1,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'ULSD',
-    component_products: ['EXXON NO2', 'EXXON NO2 DYED', 'ULS DIESEL', 'ULS DIESEL-D'],
+    bucket_name: 'CBOB',
+    component_products: ['SUBOCTREG'],
     is_virtual: false,
     display_order: 2,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'Jet',
-    component_products: ['JET A', 'JET A-1'],
+    bucket_name: 'PBOB',
+    component_products: ['SUBOCTPRE'],
     is_virtual: false,
     display_order: 3,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'CBOB',
-    component_products: ['CBOB', 'CBOB SUB'],
+    bucket_name: 'Jet',
+    component_products: ['JET FUEL', 'JET A', 'JET A-1'],
     is_virtual: false,
     display_order: 4,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'RBOB',
-    component_products: ['RBOB', 'RBOB SUB'],
+    bucket_name: 'ULSD',
+    component_products: ['EXXON NO2', 'EXXON NO2 DYED', 'ULS DIESEL', 'ULS DYE DIESEL', 'ULSDX'],
     is_virtual: false,
     display_order: 5,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'Distillate',
-    component_products: [
-      'EXXON NO2', 'EXXON NO2 DYED', 'ULS DIESEL', 'ULS DIESEL-D',
-      'JET A', 'JET A-1', 'LS DIESEL', 'HEAT OIL',
-    ],
+    bucket_name: 'VGO',
+    component_products: ['VGO', 'VACUUM GAS OIL'],
     is_virtual: false,
     display_order: 6,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'Crude Rate',
-    component_products: [], // Virtual - calculated separately
-    is_virtual: true,
-    display_order: 100,
+    bucket_name: 'VTB',
+    component_products: ['VTB', 'VACUUM TOWER BOTTOMS'],
+    is_virtual: false,
+    display_order: 7,
   },
   {
     bucket_type: 'yield' as const,
-    bucket_name: 'Non-Crude Total',
-    component_products: [], // Virtual - sum of all non-crude
-    is_virtual: true,
-    display_order: 101,
+    bucket_name: 'UMO VGO',
+    component_products: ['UMO VGO', 'UMO VACUUM GAS OIL'],
+    is_virtual: false,
+    display_order: 8,
+  },
+  {
+    bucket_type: 'yield' as const,
+    bucket_name: 'Base Oil',
+    component_products: ['BASE OIL', 'LUBE BASE OIL'],
+    is_virtual: false,
+    display_order: 9,
   },
   {
     bucket_type: 'yield' as const,
     bucket_name: 'Loss',
-    component_products: [], // Virtual - Non-Crude Total - Crude Rate
+    component_products: ['__CALC:LOSS'],  // Calculated: Crude Rate - Non-Crude Total
     is_virtual: true,
-    display_order: 102,
+    display_order: 10,
+  },
+  // Hidden buckets for internal calculations
+  {
+    bucket_type: 'yield' as const,
+    bucket_name: 'Non-Crude Total',
+    component_products: ['__CLASS:P'],  // All Product (output) products
+    is_virtual: false,
+    display_order: 99,  // Hidden from main display
   },
 ];
 

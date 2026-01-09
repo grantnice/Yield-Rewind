@@ -2,7 +2,7 @@
 
 import { useRef, useEffect, useMemo, memo } from 'react';
 import * as echarts from 'echarts/core';
-import { LineChart } from 'echarts/charts';
+import { LineChart, BarChart } from 'echarts/charts';
 import {
   TitleComponent,
   TooltipComponent,
@@ -17,6 +17,7 @@ import type { EChartsOption } from 'echarts';
 // Register ECharts components (tree-shakable)
 echarts.use([
   LineChart,
+  BarChart,
   TitleComponent,
   TooltipComponent,
   GridComponent,
@@ -51,7 +52,7 @@ export interface TimeSeriesChartProps {
   seriesLabels?: Record<string, string>;
   height?: number;
   showDataZoom?: boolean;
-  chartType?: 'line' | 'area';
+  chartType?: 'line' | 'area' | 'bar';
   stacked?: boolean;
   smooth?: boolean;
   yAxisLabel?: string;
@@ -93,17 +94,20 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
         return typeof value === 'number' ? value : null;
       });
 
+      const isBar = chartType === 'bar';
+
       return {
         name: seriesLabels[key] || key,
-        type: 'line' as const,
+        type: isBar ? ('bar' as const) : ('line' as const),
         data: seriesData,
-        smooth,
-        showSymbol: data.length < 100,
-        symbolSize: 4,
+        smooth: isBar ? undefined : smooth,
+        showSymbol: isBar ? undefined : data.length < 100,
+        symbolSize: isBar ? undefined : 4,
         color: CHART_COLORS[index % CHART_COLORS.length],
-        lineStyle: { width: 2 },
+        lineStyle: isBar ? undefined : { width: 2 },
         areaStyle: chartType === 'area' ? { opacity: stacked ? 0.7 : 0.3 } : undefined,
         stack: stacked ? 'total' : undefined,
+        barMaxWidth: isBar ? 30 : undefined,
         sampling: 'lttb' as const,
         progressive: 200,
         animation: data.length < 500,
@@ -116,7 +120,7 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
       grid: {
         left: '3%',
         right: '4%',
-        bottom: showDataZoom ? '15%' : '3%',
+        bottom: showDataZoom ? '22%' : '15%',
         top: '10%',
         containLabel: true,
       },
@@ -126,10 +130,26 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
         backgroundColor: 'rgba(255, 255, 255, 0.95)',
         borderColor: '#e5e7eb',
         textStyle: { color: '#374151' },
+        formatter: (params: any) => {
+          if (!Array.isArray(params)) return '';
+          const date = params[0]?.axisValue || '';
+          const items = params
+            .filter((p: any) => p.value != null && p.value !== 0)
+            .map((p: any) => {
+              // Check if this looks like a percentage (small values, likely yield_pct)
+              const isPercent = yAxisLabel?.includes('%');
+              const formatted = isPercent
+                ? p.value.toFixed(1) + '%'
+                : Math.round(p.value).toLocaleString();
+              return `${p.marker} ${p.seriesName}: <strong>${formatted}</strong>`;
+            })
+            .join('<br/>');
+          return `<strong>${date}</strong><br/>${items}`;
+        },
       },
       legend: {
         type: seriesKeys.length > 5 ? 'scroll' : 'plain',
-        bottom: showDataZoom ? 40 : 0,
+        bottom: showDataZoom ? 35 : 0,
         textStyle: { color: '#6b7280' },
       },
       xAxis: {
@@ -153,12 +173,12 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
           formatter: yAxisFormatter || ((value: number) => value.toLocaleString()),
           color: '#9ca3af',
         },
-        splitLine: { lineStyle: { color: '#f3f4f6', type: 'dashed' } },
+        splitLine: { lineStyle: { color: '#d1d5db', type: 'dashed' } },
       },
       dataZoom: showDataZoom
         ? [
             { type: 'inside', start: 0, end: 100, throttle: 100 },
-            { type: 'slider', start: 0, end: 100, height: 20, bottom: 10 },
+            { type: 'slider', start: 0, end: 100, height: 20, bottom: 60 },
           ]
         : [],
       toolbox: {
@@ -200,7 +220,8 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
   // Update chart options
   useEffect(() => {
     if (!chartInstance.current || Object.keys(chartOptions).length === 0) return;
-    chartInstance.current.setOption(chartOptions, { notMerge: false, lazyUpdate: true });
+    // notMerge: true ensures old series are removed when deselected
+    chartInstance.current.setOption(chartOptions, { notMerge: true, lazyUpdate: true });
   }, [chartOptions]);
 
   // Handle loading

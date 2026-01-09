@@ -21,6 +21,11 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(env_path)
+
 # Configuration
 DB_CONFIG = {
     'server': os.environ.get('DB_SERVER', '10.34.145.21'),
@@ -87,11 +92,11 @@ def get_date_range(mode: str, data_type: str) -> tuple:
             last_date = datetime.strptime(row['last_synced_date'], '%Y-%m-%d')
             start_date = (last_date + timedelta(days=1)).strftime('%Y-%m-%d')
         else:
-            # No previous sync, do last 90 days
-            start_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+            # No previous sync, start from beginning of 2025
+            start_date = '2025-01-01'
     else:
-        # Full sync - last 2 years
-        start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+        # Full sync - all of 2025 onwards
+        start_date = '2025-01-01'
 
     sqlite_conn.close()
     return (start_date, end_date)
@@ -124,28 +129,37 @@ def sync_yield_data(start_date: str, end_date: str) -> int:
         date_str = current.strftime('%Y-%m-%d')
 
         try:
-            # Call stored procedure for this date
-            sql_cursor.execute(f"EXEC {YIELD_SP} @date = ?", date_str)
+            # Call stored procedure for this date (uses begin/end date params)
+            sql_cursor.execute(f"SET NOCOUNT ON; EXEC {YIELD_SP} @rp_bgn_dte = ?, @rp_end_dte = ?", date_str, date_str)
             rows = sql_cursor.fetchall()
 
             # Delete existing data for this date
             sqlite_cursor.execute('DELETE FROM yield_data WHERE date = ?', (date_str,))
 
-            # Insert new data
+            # Insert new data (use INSERT OR REPLACE to handle duplicates)
+            # SP columns: [1]prdt_clss_alfa_nme, [4]smry_prdt_nme, [5]oi_qty, [6]rec_qty, [7]ship_qty, [8]blend_qty, [9]ci_qty
+            # Yield calculation: yield = blend + ci - oi - rec + ship
             for row in rows:
+                # Product class: 'F' = Feedstock (crude), 'P' = Product (output)
+                product_class = row[1].strip() if row[1] else None
+                oi = row.oi_qty if hasattr(row, 'oi_qty') else row[5]
+                rec = row.rec_qty if hasattr(row, 'rec_qty') else row[6]
+                ship = row.ship_qty if hasattr(row, 'ship_qty') else row[7]
+                blend = row.blend_qty if hasattr(row, 'blend_qty') else row[8]
+                ci = row.ci_qty if hasattr(row, 'ci_qty') else row[9]
+
+                # Calculate yield: blend + close - open - rec + ship
+                yield_qty = (blend or 0) + (ci or 0) - (oi or 0) - (rec or 0) + (ship or 0)
+
                 sqlite_cursor.execute('''
-                    INSERT INTO yield_data
-                    (date, product_name, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO yield_data
+                    (date, product_name, product_class, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     date_str,
-                    row.product_name if hasattr(row, 'product_name') else row[0],
-                    row.oi_qty if hasattr(row, 'oi_qty') else row[1],
-                    row.rec_qty if hasattr(row, 'rec_qty') else row[2],
-                    row.ship_qty if hasattr(row, 'ship_qty') else row[3],
-                    row.blend_qty if hasattr(row, 'blend_qty') else row[4],
-                    row.ci_qty if hasattr(row, 'ci_qty') else row[5],
-                    row.yield_qty if hasattr(row, 'yield_qty') else row[6],
+                    row.smry_prdt_nme.strip() if hasattr(row, 'smry_prdt_nme') else str(row[4]).strip(),
+                    product_class,
+                    oi, rec, ship, blend, ci, yield_qty,
                 ))
                 records_synced += 1
 
@@ -187,8 +201,8 @@ def sync_sales_data(start_date: str, end_date: str) -> int:
         date_str = current.strftime('%Y-%m-%d')
 
         try:
-            # Call stored procedure
-            sql_cursor.execute(f"EXEC {SALES_SP} @date = ?", date_str)
+            # Call stored procedure (uses begin/end date params)
+            sql_cursor.execute(f"SET NOCOUNT ON; EXEC {SALES_SP} @rp_bgn_dte = ?, @rp_end_dte = ?", date_str, date_str)
             rows = sql_cursor.fetchall()
 
             # Delete existing data
@@ -196,22 +210,29 @@ def sync_sales_data(start_date: str, end_date: str) -> int:
 
             # Insert new data (dividing by 42 to convert gallons to barrels)
             for row in rows:
+                # Get volume values (SP returns: prdt_nme, prdt_desc_txt, cust_nme, trns_type_cde, vol_qty_tr, vol_qty_h2o, vol_qty_pl, vol_qty_os)
+                vol_tr = (row.vol_qty_tr if hasattr(row, 'vol_qty_tr') else row[4]) / 42
+                vol_h2o = (row.vol_qty_h2o if hasattr(row, 'vol_qty_h2o') else row[5]) / 42
+                vol_pl = (row.vol_qty_pl if hasattr(row, 'vol_qty_pl') else row[6]) / 42
+                vol_os = (row.vol_qty_os if hasattr(row, 'vol_qty_os') else row[7]) / 42
+                vol_total = vol_tr + vol_h2o + vol_pl + vol_os  # Calculate total from components
+
                 sqlite_cursor.execute('''
-                    INSERT INTO sales_data
+                    INSERT OR REPLACE INTO sales_data
                     (date, product_name, product_desc, customer_name, transaction_type,
                      vol_qty_tr, vol_qty_h2o, vol_qty_pl, vol_qty_os, vol_qty_total)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     date_str,
-                    row.product_name if hasattr(row, 'product_name') else row[0],
-                    row.product_desc if hasattr(row, 'product_desc') else row[1],
-                    row.customer_name if hasattr(row, 'customer_name') else row[2],
-                    row.transaction_type if hasattr(row, 'transaction_type') else row[3],
-                    (row.vol_qty_tr if hasattr(row, 'vol_qty_tr') else row[4]) / 42,
-                    (row.vol_qty_h2o if hasattr(row, 'vol_qty_h2o') else row[5]) / 42,
-                    (row.vol_qty_pl if hasattr(row, 'vol_qty_pl') else row[6]) / 42,
-                    (row.vol_qty_os if hasattr(row, 'vol_qty_os') else row[7]) / 42,
-                    (row.vol_qty_total if hasattr(row, 'vol_qty_total') else row[8]) / 42,
+                    row.prdt_nme if hasattr(row, 'prdt_nme') else row[0],
+                    row.prdt_desc_txt if hasattr(row, 'prdt_desc_txt') else row[1],
+                    row.cust_nme if hasattr(row, 'cust_nme') else row[2],
+                    row.trns_type_cde if hasattr(row, 'trns_type_cde') else row[3],
+                    vol_tr,
+                    vol_h2o,
+                    vol_pl,
+                    vol_os,
+                    vol_total,
                 ))
                 records_synced += 1
 
@@ -248,14 +269,14 @@ def sync_tank_data(start_date: str, end_date: str) -> int:
 
     query = """
         SELECT
-            CONVERT(DATE, RCNC_DT) as date,
-            TANK_ID as tank_name,
-            PRDT_NM as product_name,
-            PRDT_TYPE as product_type,
-            NET_VOL as volume
+            CONVERT(DATE, RCNC_END_TMSP) as date,
+            VESS_NME as tank_name,
+            PRDT_NME as product_name,
+            COALESCE(UCRT_VOL_QTY, 0) as hc_volume,
+            COALESCE(H2O_VOL_QTY, 0) as h2o_volume
         FROM [Adv_hc].[Advisor3].[RCNC_TANK_VALU_RVW]
-        WHERE RCNC_DT BETWEEN ? AND ?
-        ORDER BY RCNC_DT, TANK_ID
+        WHERE RCNC_END_TMSP BETWEEN ? AND ?
+        ORDER BY RCNC_END_TMSP, VESS_NME
     """
 
     try:
@@ -270,15 +291,21 @@ def sync_tank_data(start_date: str, end_date: str) -> int:
 
         records_synced = 0
         for row in rows:
+            product_name = row.product_name.strip() if row.product_name else ''
+            hc_vol = row.hc_volume or 0
+            h2o_vol = row.h2o_volume or 0
+            total_vol = hc_vol + h2o_vol
+
             sqlite_cursor.execute('''
-                INSERT INTO tank_data (date, tank_name, product_name, product_type, volume)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO tank_data (date, tank_name, product_name, hc_volume, h2o_volume, total_volume)
+                VALUES (?, ?, ?, ?, ?, ?)
             ''', (
                 row.date.strftime('%Y-%m-%d') if hasattr(row.date, 'strftime') else str(row.date),
-                row.tank_name,
-                row.product_name,
-                row.product_type,
-                row.volume,
+                row.tank_name.strip() if row.tank_name else '',
+                product_name,
+                hc_vol,
+                h2o_vol,
+                total_vol,
             ))
             records_synced += 1
 
@@ -374,12 +401,12 @@ def main():
 
             # Update status
             update_sync_status(data_type, 'success', records, duration_ms)
-            print(f"\n✓ {data_type} sync complete: {records} records in {duration_ms}ms")
+            print(f"\n[OK] {data_type} sync complete: {records} records in {duration_ms}ms")
 
         except Exception as e:
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
             update_sync_status(data_type, 'error', 0, duration_ms, str(e))
-            print(f"\n✗ {data_type} sync failed: {e}")
+            print(f"\n[ERROR] {data_type} sync failed: {e}")
             sys.exit(1)
 
     print("\n" + "="*50)
