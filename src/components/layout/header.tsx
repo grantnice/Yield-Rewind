@@ -9,7 +9,6 @@ const pageTitles: Record<string, string> = {
   '/sales': 'Sales Report',
   '/tanks': 'Tank Inventory',
   '/monthly-yield': 'Monthly Yield Table',
-  '/trajectory': 'Month Trajectory',
   '/settings/buckets': 'Bucket Configuration',
   '/settings/sync': 'Sync Status',
 };

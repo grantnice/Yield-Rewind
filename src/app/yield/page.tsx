@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { TimeSeriesChart } from '@/components/charts/time-series-chart';
+import { TimeSeriesChart, TimeSeriesChartRef, YAxisBounds } from '@/components/charts/time-series-chart';
 import { getDaysAgo, getYesterday, getMonthStart, formatNumber } from '@/lib/utils';
 
 // Quick date range options
@@ -70,6 +70,12 @@ export default function YieldReport() {
   // Custom date range state
   const [customStartDate, setCustomStartDate] = useState(() => getDaysAgo(90));
   const [customEndDate, setCustomEndDate] = useState(() => getYesterday());
+
+  // Y-axis bounds state
+  const [yAxisBounds, setYAxisBounds] = useState<YAxisBounds>({ min: null, max: null });
+
+  // Chart ref for downloads
+  const chartRef = useRef<TimeSeriesChartRef>(null);
 
   // Calculate display date range (what user wants to see)
   const displayDateRange = useMemo(() => {
@@ -464,6 +470,41 @@ export default function YieldReport() {
     }).filter(Boolean);
   }, [finalChartData, selectedItems]);
 
+  // Download chart as PNG
+  const downloadChartPNG = useCallback(() => {
+    const dataUrl = chartRef.current?.getChartImage();
+    if (dataUrl) {
+      const link = document.createElement('a');
+      link.download = `yield-chart-${displayDateRange.start}-to-${displayDateRange.end}.png`;
+      link.href = dataUrl;
+      link.click();
+    }
+  }, [displayDateRange]);
+
+  // Download data as CSV
+  const downloadCSV = useCallback(() => {
+    if (!finalChartData.length) return;
+
+    // Build CSV header
+    const headers = ['Date', ...selectedItems];
+    const rows = [headers.join(',')];
+
+    // Build CSV rows
+    finalChartData.forEach((row: any) => {
+      const values = [row.date, ...selectedItems.map(item => row[item]?.toFixed(2) ?? '')];
+      rows.push(values.join(','));
+    });
+
+    const csv = rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.download = `yield-data-${displayDateRange.start}-to-${displayDateRange.end}.csv`;
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [finalChartData, selectedItems, displayDateRange]);
+
   return (
     <div className="space-y-6">
       {/* Controls */}
@@ -525,7 +566,11 @@ export default function YieldReport() {
                   key={metric.key}
                   variant={selectedMetric === metric.key ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => setSelectedMetric(metric.key)}
+                  onClick={() => {
+                    setSelectedMetric(metric.key);
+                    // Reset y-axis bounds when metric changes
+                    setYAxisBounds({ min: null, max: null });
+                  }}
                 >
                   {metric.label}
                 </Button>
@@ -635,7 +680,27 @@ export default function YieldReport() {
       {/* Chart */}
       <Card>
         <CardHeader>
-          <CardTitle>Yield Trend - {yieldMetrics.find(m => m.key === selectedMetric)?.label}</CardTitle>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle>Yield Trend - {yieldMetrics.find(m => m.key === selectedMetric)?.label}</CardTitle>
+              <p className="text-xs text-gray-500 mt-1">
+                Click on the Y-axis to set custom min/max values
+                {(yAxisBounds.min !== null || yAxisBounds.max !== null) && (
+                  <span className="ml-2 px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded">
+                    Y: {yAxisBounds.min ?? 'auto'} - {yAxisBounds.max ?? 'auto'}
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={downloadChartPNG} disabled={!finalChartData.length}>
+                Download Chart
+              </Button>
+              <Button variant="outline" size="sm" onClick={downloadCSV} disabled={!finalChartData.length}>
+                Download CSV
+              </Button>
+            </div>
+          </div>
         </CardHeader>
         <CardContent>
           {isLoading ? (
@@ -648,11 +713,14 @@ export default function YieldReport() {
             </div>
           ) : finalChartData.length > 0 ? (
             <TimeSeriesChart
+              ref={chartRef}
               data={finalChartData}
               seriesKeys={chartSeriesKeys}
               height={400}
               showDataZoom={finalChartData.length > 60}
               yAxisLabel={selectedMetric === 'yield_pct' ? 'Yield %' : yieldMetrics.find(m => m.key === selectedMetric)?.label}
+              yAxisBounds={yAxisBounds}
+              onYAxisBoundsChange={setYAxisBounds}
             />
           ) : (
             <div className="h-[400px] flex items-center justify-center bg-gray-50 rounded-lg">

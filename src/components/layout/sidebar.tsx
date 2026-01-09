@@ -9,7 +9,6 @@ import {
   ShoppingCart,
   Droplets,
   Table,
-  Target,
   Settings,
   RefreshCw,
 } from 'lucide-react';
@@ -20,7 +19,6 @@ const navigation = [
   { name: 'Sales Report', href: '/sales', icon: ShoppingCart },
   { name: 'Tank Inventory', href: '/tanks', icon: Droplets },
   { name: 'Monthly Yield', href: '/monthly-yield', icon: Table },
-  { name: 'Trajectory', href: '/trajectory', icon: Target },
 ];
 
 const settingsNav = [

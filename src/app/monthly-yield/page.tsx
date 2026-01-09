@@ -2,6 +2,9 @@
 
 import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { PeriodManagerModal } from '@/components/periods/period-manager-modal';
+import { PeriodTabs } from '@/components/periods/period-tabs';
+import { Settings2 } from 'lucide-react';
 
 // Get month options for the last 12 months
 function getMonthOptions() {
@@ -153,6 +156,15 @@ function StatusBar({ status, variance }: { status: 'good' | 'warning' | 'bad' | 
   );
 }
 
+// Rolling days options for trajectory
+const ROLLING_DAYS_OPTIONS = [1, 2, 3, 5, 7];
+
+interface Period {
+  period_number: number;
+  start_day: number;
+  end_day: number;
+}
+
 export default function MonthlyYieldTable() {
   const queryClient = useQueryClient();
   const monthOptions = getMonthOptions();
@@ -160,18 +172,45 @@ export default function MonthlyYieldTable() {
   const [isEditing, setIsEditing] = useState(false);
   const [editTargets, setEditTargets] = useState<EditableTarget[]>([]);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [rollingDays, setRollingDays] = useState(2);
+  const [periodModalOpen, setPeriodModalOpen] = useState(false);
+  const [selectedPeriod, setSelectedPeriod] = useState<number | null>(null);
 
-  // Fetch MTD data
-  const { data: mtdData, isLoading: mtdLoading } = useQuery({
-    queryKey: ['yield-mtd', selectedMonth.value],
+  // Fetch periods configuration for the month
+  const { data: periodsData } = useQuery({
+    queryKey: ['periods', selectedMonth.value],
     queryFn: async () => {
-      const res = await fetch(`/api/yield/mtd?month=${selectedMonth.value}`);
+      const res = await fetch(`/api/periods?month=${selectedMonth.value}`);
+      if (!res.ok) throw new Error('Failed to fetch periods');
+      return res.json();
+    },
+  });
+
+  const periods: Period[] = periodsData?.periods || [];
+  const hasPeriods = periods.length > 0;
+
+  // Reset selected period when month changes or periods are deleted
+  useEffect(() => {
+    if (!hasPeriods) {
+      setSelectedPeriod(null);
+    }
+  }, [hasPeriods, selectedMonth.value]);
+
+  // Fetch MTD data (with optional period parameter)
+  const { data: mtdData, isLoading: mtdLoading } = useQuery({
+    queryKey: ['yield-mtd', selectedMonth.value, selectedPeriod],
+    queryFn: async () => {
+      let url = `/api/yield/mtd?month=${selectedMonth.value}`;
+      if (selectedPeriod !== null) {
+        url += `&period=${selectedPeriod}`;
+      }
+      const res = await fetch(url);
       if (!res.ok) throw new Error('Failed to fetch MTD data');
       return res.json();
     },
   });
 
-  // Fetch targets for selected month
+  // Fetch targets for selected month (or period if selected)
   const { data: targetsData, isLoading: targetsLoading } = useQuery({
     queryKey: ['yield-targets', selectedMonth.value],
     queryFn: async () => {
@@ -181,19 +220,61 @@ export default function MonthlyYieldTable() {
     },
   });
 
-  // Save targets mutation
-  const saveTargetsMutation = useMutation({
-    mutationFn: async (targets: Partial<YieldTarget>[]) => {
-      const res = await fetch('/api/targets', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ month: selectedMonth.value, targets }),
-      });
-      if (!res.ok) throw new Error('Failed to save targets');
+  // Fetch period targets when a specific period is selected
+  const { data: periodTargetsData } = useQuery({
+    queryKey: ['period-targets', selectedMonth.value, selectedPeriod],
+    queryFn: async () => {
+      const res = await fetch(`/api/period-targets?month=${selectedMonth.value}&period=${selectedPeriod}`);
+      if (!res.ok) throw new Error('Failed to fetch period targets');
       return res.json();
     },
+    enabled: selectedPeriod !== null,
+  });
+
+  // Fetch trajectory data
+  const { data: trajectoryData, isLoading: trajectoryLoading } = useQuery({
+    queryKey: ['yield-trajectory', selectedMonth.value, rollingDays],
+    queryFn: async () => {
+      const res = await fetch(`/api/yield/trajectory?month=${selectedMonth.value}&rolling_days=${rollingDays}`);
+      if (!res.ok) throw new Error('Failed to fetch trajectory');
+      return res.json();
+    },
+  });
+
+  // Save targets mutation (supports both monthly and period targets)
+  const saveTargetsMutation = useMutation({
+    mutationFn: async (targets: Partial<YieldTarget>[]) => {
+      if (selectedPeriod !== null) {
+        // Save to period targets
+        const res = await fetch('/api/period-targets', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            month: selectedMonth.value,
+            period_number: selectedPeriod,
+            targets,
+          }),
+        });
+        if (!res.ok) throw new Error('Failed to save period targets');
+        return res.json();
+      } else {
+        // Save to monthly targets
+        const res = await fetch('/api/targets', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ month: selectedMonth.value, targets }),
+        });
+        if (!res.ok) throw new Error('Failed to save targets');
+        return res.json();
+      }
+    },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['yield-targets', selectedMonth.value] });
+      if (selectedPeriod !== null) {
+        queryClient.invalidateQueries({ queryKey: ['period-targets', selectedMonth.value, selectedPeriod] });
+        queryClient.invalidateQueries({ queryKey: ['yield-mtd', selectedMonth.value] });
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['yield-targets', selectedMonth.value] });
+      }
       setSaveStatus('saved');
       setTimeout(() => setSaveStatus('idle'), 2000);
     },
@@ -203,16 +284,58 @@ export default function MonthlyYieldTable() {
     },
   });
 
-  // Create lookup for targets
-  const targetsLookup = useMemo(() => {
-    const lookup: Record<string, YieldTarget> = {};
+  // Create lookup for monthly BP targets (always from yield_targets table)
+  const monthlyBpLookup = useMemo(() => {
+    const lookup: Record<string, { business_plan_target: number | null; business_plan_rate: number | null }> = {};
     if (targetsData?.targets) {
       targetsData.targets.forEach((t: YieldTarget) => {
-        lookup[t.bucket_name] = t;
+        lookup[t.bucket_name] = {
+          business_plan_target: t.business_plan_target,
+          business_plan_rate: t.business_plan_rate,
+        };
       });
     }
     return lookup;
   }, [targetsData]);
+
+  // Create lookup for targets (use period targets for monthly_plan, but always use monthly for BP)
+  const targetsLookup = useMemo(() => {
+    const lookup: Record<string, YieldTarget> = {};
+
+    if (selectedPeriod !== null && periodTargetsData?.targets) {
+      // Use period-specific targets for monthly_plan values
+      periodTargetsData.targets.forEach((t: YieldTarget) => {
+        // Merge period monthly_plan with monthly BP values
+        const monthlyBp = monthlyBpLookup[t.bucket_name];
+        lookup[t.bucket_name] = {
+          ...t,
+          // BP values always come from monthly targets
+          business_plan_target: monthlyBp?.business_plan_target ?? null,
+          business_plan_rate: monthlyBp?.business_plan_rate ?? null,
+        };
+      });
+      // Also include buckets that may not have period targets but have monthly BP
+      if (targetsData?.targets) {
+        targetsData.targets.forEach((t: YieldTarget) => {
+          if (!lookup[t.bucket_name]) {
+            lookup[t.bucket_name] = {
+              ...t,
+              // No period targets, so monthly_plan is null
+              monthly_plan_target: null,
+              monthly_plan_rate: null,
+            };
+          }
+        });
+      }
+    } else if (targetsData?.targets) {
+      // Use monthly targets (includes both monthly_plan and BP)
+      targetsData.targets.forEach((t: YieldTarget) => {
+        lookup[t.bucket_name] = t;
+      });
+    }
+
+    return lookup;
+  }, [targetsData, periodTargetsData, selectedPeriod, monthlyBpLookup]);
 
   // Get crude rate daily average for percentage calculations (use absolute value)
   const crudeRateDailyAvg = Math.abs(mtdData?.meta?.crude_rate_daily_avg || 0);
@@ -300,24 +423,27 @@ export default function MonthlyYieldTable() {
     });
   }, [mtdData, targetsLookup, crudeRateDailyAvg, crudeRatePlanRate, crudeRateBpRate]);
 
-  // Initialize edit targets when entering edit mode
+  // Initialize edit targets when entering edit mode or period changes
   useEffect(() => {
     if (isEditing && mtdData?.data) {
       setEditTargets(
         mtdData.data
           .map((bucket: BucketMTD) => {
             const target = targetsLookup[bucket.bucket_name];
+            // For BP values, always use monthly targets (they don't change per period)
+            const monthlyBp = monthlyBpLookup[bucket.bucket_name];
             return {
               bucket_name: bucket.bucket_name,
               monthly_plan_target: target?.monthly_plan_target?.toString() || '',
-              business_plan_target: target?.business_plan_target?.toString() || '',
+              // BP values always from monthly targets
+              business_plan_target: monthlyBp?.business_plan_target?.toString() || '',
               monthly_plan_rate: target?.monthly_plan_rate?.toString() || '',
-              business_plan_rate: target?.business_plan_rate?.toString() || '',
+              business_plan_rate: monthlyBp?.business_plan_rate?.toString() || '',
             };
           })
       );
     }
-  }, [isEditing, mtdData, targetsLookup]);
+  }, [isEditing, mtdData, targetsLookup, selectedPeriod, monthlyBpLookup]);
 
   // Handle target input change
   const handleTargetChange = useCallback((
@@ -335,16 +461,30 @@ export default function MonthlyYieldTable() {
   // Save targets
   const handleSave = useCallback(() => {
     setSaveStatus('saving');
-    const targets = editTargets.map(t => ({
-      bucket_name: t.bucket_name,
-      monthly_plan_target: t.monthly_plan_target ? parseFloat(t.monthly_plan_target) : null,
-      business_plan_target: t.business_plan_target ? parseFloat(t.business_plan_target) : null,
-      monthly_plan_rate: t.monthly_plan_rate ? parseFloat(t.monthly_plan_rate) : null,
-      business_plan_rate: t.business_plan_rate ? parseFloat(t.business_plan_rate) : null,
-    }));
+
+    // When saving period targets, don't include BP values (they're monthly-only)
+    const targets = editTargets.map(t => {
+      if (selectedPeriod !== null) {
+        // Period targets: only monthly_plan values
+        return {
+          bucket_name: t.bucket_name,
+          monthly_plan_target: t.monthly_plan_target ? parseFloat(t.monthly_plan_target) : null,
+          monthly_plan_rate: t.monthly_plan_rate ? parseFloat(t.monthly_plan_rate) : null,
+        };
+      } else {
+        // Monthly targets: include both monthly_plan and BP values
+        return {
+          bucket_name: t.bucket_name,
+          monthly_plan_target: t.monthly_plan_target ? parseFloat(t.monthly_plan_target) : null,
+          business_plan_target: t.business_plan_target ? parseFloat(t.business_plan_target) : null,
+          monthly_plan_rate: t.monthly_plan_rate ? parseFloat(t.monthly_plan_rate) : null,
+          business_plan_rate: t.business_plan_rate ? parseFloat(t.business_plan_rate) : null,
+        };
+      }
+    });
     saveTargetsMutation.mutate(targets);
     setIsEditing(false);
-  }, [editTargets, saveTargetsMutation]);
+  }, [editTargets, saveTargetsMutation, selectedPeriod]);
 
   // Cancel editing
   const handleCancel = useCallback(() => {
@@ -408,9 +548,18 @@ export default function MonthlyYieldTable() {
               <h1 className="text-2xl font-semibold tracking-tight text-gray-900">
                 Yield Performance
               </h1>
+              {selectedPeriod !== null && (
+                <span className="px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-700 rounded-full">
+                  Period {selectedPeriod}
+                </span>
+              )}
             </div>
             <p className="text-gray-500 text-sm ml-5">
-              MTD Daily Averages vs Plan Targets
+              {selectedPeriod !== null
+                ? `Period ${selectedPeriod} Daily Averages vs Targets`
+                : hasPeriods
+                  ? 'Full Month Daily Averages vs Blended Plan'
+                  : 'MTD Daily Averages vs Plan Targets'}
             </p>
           </div>
 
@@ -464,30 +613,50 @@ export default function MonthlyYieldTable() {
         </div>
 
         {/* Month Selector */}
-        <div className="mb-6">
-          <div className="inline-flex bg-white border border-gray-200 rounded-xl p-1 shadow-sm">
-            {monthOptions.slice(0, 6).map((month, idx) => (
-              <button
-                key={month.value}
-                onClick={() => setSelectedMonth(month)}
-                className={`px-4 py-2 text-sm font-medium rounded-lg transition-all ${
-                  selectedMonth.value === month.value
-                    ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-white shadow-md shadow-amber-500/25'
-                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
-                }`}
-              >
-                {month.shortLabel}
-                {idx === 0 && (
-                  <span className={`ml-1.5 text-[10px] uppercase tracking-wider ${
-                    selectedMonth.value === month.value ? 'opacity-80' : 'opacity-50'
-                  }`}>
-                    {month.year}
-                  </span>
-                )}
-              </button>
-            ))}
+        <div className="mb-6 flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="inline-flex bg-white border border-gray-200 rounded-xl p-1 shadow-sm">
+              {monthOptions.slice(0, 6).map((month, idx) => (
+                <button
+                  key={month.value}
+                  onClick={() => setSelectedMonth(month)}
+                  className={`px-4 py-2 text-sm font-medium rounded-lg transition-all ${
+                    selectedMonth.value === month.value
+                      ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-white shadow-md shadow-amber-500/25'
+                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                  }`}
+                >
+                  {month.shortLabel}
+                  {idx === 0 && (
+                    <span className={`ml-1.5 text-[10px] uppercase tracking-wider ${
+                      selectedMonth.value === month.value ? 'opacity-80' : 'opacity-50'
+                    }`}>
+                      {month.year}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setPeriodModalOpen(true)}
+              className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-600 hover:text-gray-900 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors shadow-sm"
+            >
+              <Settings2 className="h-4 w-4" />
+              Configure Periods
+            </button>
           </div>
         </div>
+
+        {/* Period Tabs (if periods exist) */}
+        {hasPeriods && (
+          <div className="mb-6">
+            <PeriodTabs
+              periods={periods}
+              selectedPeriod={selectedPeriod}
+              onPeriodChange={setSelectedPeriod}
+            />
+          </div>
+        )}
 
         {/* Meta Info */}
         {mtdData?.meta && (
@@ -644,34 +813,40 @@ export default function MonthlyYieldTable() {
                               <input
                                 type="number"
                                 step="100"
-                                className="yield-input w-20 px-2 py-1 text-right text-xs rounded"
+                                className={`yield-input w-20 px-2 py-1 text-right text-xs rounded ${selectedPeriod !== null ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
                                 value={editRow?.business_plan_rate || ''}
                                 onChange={(e) =>
                                   handleTargetChange(row.bucket_name, 'business_plan_rate', e.target.value)
                                 }
                                 placeholder="BBL"
+                                disabled={selectedPeriod !== null}
+                                title={selectedPeriod !== null ? 'BP values are monthly-only' : ''}
                               />
                             ) : (
                               <div className="flex flex-col gap-1.5 items-end">
                                 <input
                                   type="number"
                                   step="100"
-                                  className="yield-input w-20 px-2 py-1 text-right text-xs rounded"
+                                  className={`yield-input w-20 px-2 py-1 text-right text-xs rounded ${selectedPeriod !== null ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
                                   value={editRow?.business_plan_rate || ''}
                                   onChange={(e) =>
                                     handleTargetChange(row.bucket_name, 'business_plan_rate', e.target.value)
                                   }
                                   placeholder="BBL"
+                                  disabled={selectedPeriod !== null}
+                                  title={selectedPeriod !== null ? 'BP values are monthly-only' : ''}
                                 />
                                 <input
                                   type="number"
                                   step="0.01"
-                                  className="yield-input w-20 px-2 py-1 text-right text-xs rounded"
+                                  className={`yield-input w-20 px-2 py-1 text-right text-xs rounded ${selectedPeriod !== null ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
                                   value={editRow?.business_plan_target || ''}
                                   onChange={(e) =>
                                     handleTargetChange(row.bucket_name, 'business_plan_target', e.target.value)
                                   }
                                   placeholder="%"
+                                  disabled={selectedPeriod !== null}
+                                  title={selectedPeriod !== null ? 'BP values are monthly-only' : ''}
                                 />
                               </div>
                             )
@@ -759,6 +934,233 @@ export default function MonthlyYieldTable() {
           )}
         </div>
 
+        {/* Trajectory Projection Section */}
+        <div className="mt-8">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-2 h-8 bg-gradient-to-b from-blue-500 to-blue-600 rounded-full shadow-lg shadow-blue-500/30" />
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">EOM Trajectory</h2>
+                <p className="text-xs text-gray-500">Projected end-of-month based on recent trend</p>
+              </div>
+            </div>
+
+            {/* Rolling Days Selector */}
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-gray-500">Trend based on last</span>
+              <div className="inline-flex bg-white border border-gray-200 rounded-lg p-0.5 shadow-sm">
+                {ROLLING_DAYS_OPTIONS.map((days) => (
+                  <button
+                    key={days}
+                    onClick={() => setRollingDays(days)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
+                      rollingDays === days
+                        ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white shadow-md shadow-blue-500/25'
+                        : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                    }`}
+                  >
+                    {days}d
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Trajectory Meta Info */}
+          {trajectoryData?.meta && (
+            <div className="flex flex-col gap-2 mb-4">
+              {/* Data Warning */}
+              {trajectoryData.meta.data_warning && (
+                <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-700 text-xs">
+                  <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                  <span>{trajectoryData.meta.data_warning}</span>
+                </div>
+              )}
+              <div className="flex items-center gap-6 text-xs text-gray-500 font-mono-data uppercase tracking-wide">
+                <span className="flex items-center gap-2">
+                  <span className={`w-1.5 h-1.5 rounded-full shadow-sm ${
+                    trajectoryData.meta.data_is_stale
+                      ? 'bg-amber-500 shadow-amber-500/50'
+                      : 'bg-blue-500 shadow-blue-500/50'
+                  }`} />
+                  {trajectoryData.meta.days_remaining} days remaining
+                </span>
+                <span>Trend data: {trajectoryData.meta.recent_start} to {trajectoryData.meta.recent_end} ({trajectoryData.meta.actual_recent_days} days)</span>
+                {trajectoryData.meta.data_age_days > 0 && (
+                  <span className={trajectoryData.meta.data_is_stale ? 'text-amber-600' : ''}>
+                    {trajectoryData.meta.data_age_days}d ago
+                  </span>
+                )}
+                <span>{trajectoryData.meta.query_time_ms}ms</span>
+              </div>
+            </div>
+          )}
+
+          {/* Trajectory Table */}
+          <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xl shadow-gray-200/50">
+            {trajectoryLoading ? (
+              <div className="h-[300px] flex items-center justify-center">
+                <div className="flex flex-col items-center gap-4">
+                  <div className="w-8 h-8 border-2 border-blue-200 border-t-blue-500 rounded-full animate-spin" />
+                  <p className="text-gray-500 text-sm">Calculating projections...</p>
+                </div>
+              </div>
+            ) : trajectoryData?.data && trajectoryData.data.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-gray-200 bg-gray-50/80">
+                      <th className="text-left py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                        Product Bucket
+                      </th>
+                      <th className="text-right py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                        <div>MTD Avg</div>
+                        <div className="text-[10px] text-gray-400 font-normal mt-0.5">BBL/day</div>
+                      </th>
+                      <th className="text-right py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                        <div>Recent Trend</div>
+                        <div className="text-[10px] text-gray-400 font-normal mt-0.5">{rollingDays}d avg</div>
+                      </th>
+                      <th className="text-center py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                        Trend
+                      </th>
+                      <th className="text-right py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                        <div>Projected EOM</div>
+                        <div className="text-[10px] text-gray-400 font-normal mt-0.5">BBL/day</div>
+                      </th>
+                      <th className="text-right py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                        Target
+                      </th>
+                      <th className="py-4 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider w-32">
+                        vs Target
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {trajectoryData.data.map((row: any, idx: number) => {
+                      const isCrudeRate = row.bucket_name === 'Crude Rate';
+                      const trendDirection = row.trend_pct > 0.5 ? 'up' : row.trend_pct < -0.5 ? 'down' : 'flat';
+                      const projectedStatus = getStatus(row.variance_pct, row.bucket_name);
+
+                      return (
+                        <tr
+                          key={row.bucket_name}
+                          className={`table-row-hover transition-colors ${
+                            isCrudeRate
+                              ? 'bg-gradient-to-r from-blue-50 to-transparent border-l-2 border-l-blue-500'
+                              : ''
+                          }`}
+                        >
+                          <td className="py-4 px-6">
+                            <div className="flex items-center gap-3">
+                              {isCrudeRate ? (
+                                <div className="w-2 h-2 rounded-full bg-blue-500 shadow-sm shadow-blue-500/50" />
+                              ) : (
+                                <div className="w-2 h-2 rounded-full bg-gray-300" />
+                              )}
+                              <span className={`font-medium ${isCrudeRate ? 'text-blue-700' : 'text-gray-900'}`}>
+                                {row.bucket_name}
+                              </span>
+                            </div>
+                          </td>
+                          {/* MTD Avg */}
+                          <td className="text-right py-4 px-6 font-mono-data text-sm text-gray-600">
+                            {formatNumber(Math.abs(row.mtd_daily_avg), 0)}
+                          </td>
+                          {/* Recent Trend */}
+                          <td className="text-right py-4 px-6 font-mono-data text-sm">
+                            <span className={
+                              trendDirection === 'up' ? 'text-emerald-600' :
+                              trendDirection === 'down' ? 'text-rose-600' : 'text-gray-700'
+                            }>
+                              {formatNumber(Math.abs(row.recent_avg), 0)}
+                            </span>
+                          </td>
+                          {/* Trend Direction */}
+                          <td className="text-center py-4 px-6">
+                            <div className="flex items-center justify-center gap-1">
+                              {trendDirection === 'up' && (
+                                <svg className="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 11l5-5m0 0l5 5m-5-5v12" />
+                                </svg>
+                              )}
+                              {trendDirection === 'down' && (
+                                <svg className="w-4 h-4 text-rose-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 13l-5 5m0 0l-5-5m5 5V6" />
+                                </svg>
+                              )}
+                              {trendDirection === 'flat' && (
+                                <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14" />
+                                </svg>
+                              )}
+                              <span className={`text-xs font-mono-data ${
+                                trendDirection === 'up' ? 'text-emerald-600' :
+                                trendDirection === 'down' ? 'text-rose-600' : 'text-gray-500'
+                              }`}>
+                                {row.trend_pct >= 0 ? '+' : ''}{row.trend_pct.toFixed(1)}%
+                              </span>
+                            </div>
+                          </td>
+                          {/* Projected EOM */}
+                          <td className="text-right py-4 px-6 font-mono-data">
+                            <span className={`font-semibold ${
+                              projectedStatus === 'good' ? 'text-emerald-600' :
+                              projectedStatus === 'warning' ? 'text-amber-600' :
+                              projectedStatus === 'bad' ? 'text-rose-600' : 'text-gray-900'
+                            }`}>
+                              {formatNumber(Math.abs(row.projected_daily_avg), 0)}
+                            </span>
+                          </td>
+                          {/* Target */}
+                          <td className="text-right py-4 px-6 font-mono-data text-sm text-gray-600">
+                            {row.target_rate !== null ? formatNumber(row.target_rate, 0) : '—'}
+                          </td>
+                          {/* Variance from Target */}
+                          <td className="py-4 px-6">
+                            {row.variance_pct !== null ? (
+                              <div className="flex items-center gap-3">
+                                <div className="flex-1">
+                                  <StatusBar status={projectedStatus} variance={row.variance_pct} />
+                                </div>
+                                <span className={`font-mono-data text-xs min-w-[50px] text-right font-semibold ${
+                                  row.variance_pct >= 0 ? 'text-emerald-600' : 'text-rose-600'
+                                }`}>
+                                  {row.variance_pct >= 0 ? '+' : ''}{row.variance_pct.toFixed(1)}%
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="h-2" />
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="h-[200px] flex items-center justify-center">
+                <div className="text-center">
+                  <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center mx-auto mb-4">
+                    <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                    </svg>
+                  </div>
+                  <p className="text-gray-500">No trajectory data available</p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Trajectory Footer */}
+          <div className="mt-4 text-xs text-gray-500">
+            <span><strong className="text-gray-700">Projected EOM</strong> = MTD Total + (Recent Avg × Days Remaining) / Total Days</span>
+          </div>
+        </div>
+
         {/* Footer Info */}
         <div className="mt-6 flex items-center justify-between text-xs text-gray-500">
           <div className="flex items-center gap-6">
@@ -774,6 +1176,17 @@ export default function MonthlyYieldTable() {
           </span>
         </div>
       </div>
+
+      {/* Period Manager Modal */}
+      <PeriodManagerModal
+        open={periodModalOpen}
+        onOpenChange={setPeriodModalOpen}
+        month={selectedMonth.value}
+        onPeriodsChanged={() => {
+          queryClient.invalidateQueries({ queryKey: ['periods', selectedMonth.value] });
+          queryClient.invalidateQueries({ queryKey: ['yield-mtd', selectedMonth.value] });
+        }}
+      />
     </div>
   );
 }

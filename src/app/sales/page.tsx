@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -55,6 +55,8 @@ export default function SalesReport() {
   // Custom date range state
   const [customStartDate, setCustomStartDate] = useState(() => getDaysAgo(90));
   const [customEndDate, setCustomEndDate] = useState(() => getYesterday());
+  // Customer lookup state
+  const [selectedCustomer, setSelectedCustomer] = useState<string | null>(null);
 
   // Calculate display date range
   const displayDateRange = useMemo(() => {
@@ -216,6 +218,64 @@ export default function SalesReport() {
       .sort((a, b) => b.volume - a.volume)
       .slice(0, 10);
   }, [data, selectedItems, selectedMetric, bucketMap]);
+
+  // Get all unique customers
+  const allCustomers = useMemo(() => {
+    if (!data?.data) return [];
+    const customers = new Set<string>();
+    data.data.forEach((row: any) => {
+      if (row.customer_name) customers.add(row.customer_name);
+    });
+    return Array.from(customers).sort();
+  }, [data]);
+
+  // Detailed customer transactions
+  const customerTransactions = useMemo(() => {
+    if (!data?.data || !selectedCustomer) return [];
+
+    return data.data
+      .filter((row: any) => row.customer_name === selectedCustomer)
+      .map((row: any) => ({
+        date: row.date,
+        product: row.product_name,
+        vol_qty_total: row.vol_qty_total || 0,
+        vol_qty_tr: row.vol_qty_tr || 0,
+        vol_qty_pl: row.vol_qty_pl || 0,
+        vol_qty_h2o: row.vol_qty_h2o || 0,
+        vol_qty_os: row.vol_qty_os || 0,
+      }))
+      .sort((a: any, b: any) => b.date.localeCompare(a.date));
+  }, [data, selectedCustomer]);
+
+  // Download customer data as CSV
+  const downloadCustomerCSV = useCallback(() => {
+    if (!customerTransactions.length || !selectedCustomer) return;
+
+    const headers = ['Date', 'Product', 'Total Volume', 'Truck Rack', 'Pipeline', 'Marine', 'Other'];
+    const rows = [headers.join(',')];
+
+    customerTransactions.forEach((row: any) => {
+      const values = [
+        row.date,
+        `"${row.product}"`,
+        row.vol_qty_total.toFixed(2),
+        row.vol_qty_tr.toFixed(2),
+        row.vol_qty_pl.toFixed(2),
+        row.vol_qty_h2o.toFixed(2),
+        row.vol_qty_os.toFixed(2),
+      ];
+      rows.push(values.join(','));
+    });
+
+    const csv = rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.download = `${selectedCustomer.replace(/[^a-zA-Z0-9]/g, '_')}-sales-${displayDateRange.start}-to-${displayDateRange.end}.csv`;
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [customerTransactions, selectedCustomer, displayDateRange]);
 
   return (
     <div className="space-y-6">
@@ -462,7 +522,11 @@ export default function SalesReport() {
                   </thead>
                   <tbody>
                     {customerBreakdown.map((customer) => (
-                      <tr key={customer.name} className="border-b hover:bg-gray-50">
+                      <tr
+                        key={customer.name}
+                        className={`border-b cursor-pointer hover:bg-blue-50 ${selectedCustomer === customer.name ? 'bg-blue-100' : ''}`}
+                        onClick={() => setSelectedCustomer(selectedCustomer === customer.name ? null : customer.name)}
+                      >
                         <td className="py-2 px-3 font-medium">{customer.name}</td>
                         <td className="text-right py-2 px-3">{formatNumber(customer.volume)}</td>
                       </tr>
@@ -474,6 +538,89 @@ export default function SalesReport() {
           </Card>
         )}
       </div>
+
+      {/* Customer Lookup Section */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle>Customer Volume Lookup</CardTitle>
+            {selectedCustomer && (
+              <Button variant="outline" size="sm" onClick={downloadCustomerCSV}>
+                Download CSV
+              </Button>
+            )}
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            {/* Customer Selector */}
+            <div className="flex items-center gap-4">
+              <label className="text-sm font-medium text-gray-700">Select Customer:</label>
+              <select
+                value={selectedCustomer || ''}
+                onChange={(e) => setSelectedCustomer(e.target.value || null)}
+                className="px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 min-w-[250px]"
+              >
+                <option value="">-- Select a customer --</option>
+                {allCustomers.map((customer) => (
+                  <option key={customer} value={customer}>{customer}</option>
+                ))}
+              </select>
+              {selectedCustomer && (
+                <Button variant="ghost" size="sm" onClick={() => setSelectedCustomer(null)}>
+                  Clear
+                </Button>
+              )}
+            </div>
+
+            {/* Customer Transactions Table */}
+            {selectedCustomer && customerTransactions.length > 0 ? (
+              <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-white">
+                    <tr className="border-b">
+                      <th className="text-left py-2 px-3 font-semibold">Date</th>
+                      <th className="text-left py-2 px-3 font-semibold">Product</th>
+                      <th className="text-right py-2 px-3 font-semibold">Total</th>
+                      <th className="text-right py-2 px-3 font-semibold">Truck</th>
+                      <th className="text-right py-2 px-3 font-semibold">Pipeline</th>
+                      <th className="text-right py-2 px-3 font-semibold">Marine</th>
+                      <th className="text-right py-2 px-3 font-semibold">Other</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {customerTransactions.map((row: any, idx: number) => (
+                      <tr key={`${row.date}-${row.product}-${idx}`} className="border-b hover:bg-gray-50">
+                        <td className="py-2 px-3">{row.date}</td>
+                        <td className="py-2 px-3">{row.product}</td>
+                        <td className="text-right py-2 px-3 font-medium">{formatNumber(row.vol_qty_total)}</td>
+                        <td className="text-right py-2 px-3">{formatNumber(row.vol_qty_tr)}</td>
+                        <td className="text-right py-2 px-3">{formatNumber(row.vol_qty_pl)}</td>
+                        <td className="text-right py-2 px-3">{formatNumber(row.vol_qty_h2o)}</td>
+                        <td className="text-right py-2 px-3">{formatNumber(row.vol_qty_os)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot className="sticky bottom-0 bg-gray-50 font-semibold">
+                    <tr className="border-t-2">
+                      <td className="py-2 px-3" colSpan={2}>Total ({customerTransactions.length} transactions)</td>
+                      <td className="text-right py-2 px-3">{formatNumber(customerTransactions.reduce((sum: number, r: any) => sum + r.vol_qty_total, 0))}</td>
+                      <td className="text-right py-2 px-3">{formatNumber(customerTransactions.reduce((sum: number, r: any) => sum + r.vol_qty_tr, 0))}</td>
+                      <td className="text-right py-2 px-3">{formatNumber(customerTransactions.reduce((sum: number, r: any) => sum + r.vol_qty_pl, 0))}</td>
+                      <td className="text-right py-2 px-3">{formatNumber(customerTransactions.reduce((sum: number, r: any) => sum + r.vol_qty_h2o, 0))}</td>
+                      <td className="text-right py-2 px-3">{formatNumber(customerTransactions.reduce((sum: number, r: any) => sum + r.vol_qty_os, 0))}</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            ) : selectedCustomer ? (
+              <p className="text-gray-500 text-center py-8">No transactions found for {selectedCustomer}</p>
+            ) : (
+              <p className="text-gray-500 text-center py-8">Select a customer to view their transactions</p>
+            )}
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

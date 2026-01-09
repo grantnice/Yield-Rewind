@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useEffect, useMemo, memo } from 'react';
+import { useRef, useEffect, useMemo, memo, useImperativeHandle, forwardRef, useCallback, useState } from 'react';
 import * as echarts from 'echarts/core';
 import { LineChart, BarChart } from 'echarts/charts';
 import {
@@ -13,6 +13,7 @@ import {
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import type { EChartsOption } from 'echarts';
+import { RotateCcw } from 'lucide-react';
 
 // Register ECharts components (tree-shakable)
 echarts.use([
@@ -46,6 +47,11 @@ export interface TimeSeriesDataPoint {
   [key: string]: string | number | null | undefined;
 }
 
+export interface YAxisBounds {
+  min: number | null;
+  max: number | null;
+}
+
 export interface TimeSeriesChartProps {
   data: TimeSeriesDataPoint[];
   seriesKeys: string[];
@@ -58,9 +64,15 @@ export interface TimeSeriesChartProps {
   yAxisLabel?: string;
   yAxisFormatter?: (value: number) => string;
   loading?: boolean;
+  yAxisBounds?: YAxisBounds;
+  onYAxisBoundsChange?: (bounds: YAxisBounds) => void;
 }
 
-export const TimeSeriesChart = memo(function TimeSeriesChart({
+export interface TimeSeriesChartRef {
+  getChartImage: () => string | undefined;
+}
+
+export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesChartProps>(function TimeSeriesChart({
   data,
   seriesKeys,
   seriesLabels = {},
@@ -72,15 +84,114 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
   yAxisLabel,
   yAxisFormatter,
   loading = false,
-}: TimeSeriesChartProps) {
+  yAxisBounds,
+  onYAxisBoundsChange,
+}: TimeSeriesChartProps, ref) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstance = useRef<echarts.ECharts | null>(null);
 
-  // Format dates for display
-  const formatDate = (dateStr: string) => {
+  // Y-axis popup state
+  const [showYAxisPopup, setShowYAxisPopup] = useState(false);
+  const [popupPosition, setPopupPosition] = useState({ x: 0, y: 0 });
+  const [editMin, setEditMin] = useState<string>('');
+  const [editMax, setEditMax] = useState<string>('');
+  const popupRef = useRef<HTMLDivElement>(null);
+
+  // Initialize edit values when popup opens
+  useEffect(() => {
+    if (showYAxisPopup) {
+      setEditMin(yAxisBounds?.min?.toString() ?? '');
+      setEditMax(yAxisBounds?.max?.toString() ?? '');
+    }
+  }, [showYAxisPopup, yAxisBounds]);
+
+  // Close popup when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (popupRef.current && !popupRef.current.contains(event.target as Node)) {
+        setShowYAxisPopup(false);
+      }
+    };
+
+    if (showYAxisPopup) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showYAxisPopup]);
+
+  // Handle y-axis click
+  const handleYAxisClick = useCallback((event: MouseEvent) => {
+    if (!chartInstance.current || !chartRef.current || !onYAxisBoundsChange) return;
+
+    const chart = chartInstance.current;
+    const rect = chartRef.current.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+
+    // Get the grid info to determine y-axis area
+    const gridInfo = chart.getOption().grid as any;
+    if (!gridInfo || !gridInfo[0]) return;
+
+    // Calculate y-axis area (left side of chart)
+    const containerWidth = rect.width;
+    const yAxisWidth = containerWidth * 0.1; // Approximate y-axis width
+
+    // Check if click is in y-axis area (left ~10% of chart)
+    if (x < yAxisWidth) {
+      setPopupPosition({ x: event.clientX, y: event.clientY });
+      setShowYAxisPopup(true);
+    }
+  }, [onYAxisBoundsChange]);
+
+  // Apply y-axis bounds
+  const handleApplyBounds = useCallback(() => {
+    if (!onYAxisBoundsChange) return;
+
+    const min = editMin.trim() === '' ? null : parseFloat(editMin);
+    const max = editMax.trim() === '' ? null : parseFloat(editMax);
+
+    onYAxisBoundsChange({
+      min: min !== null && !isNaN(min) ? min : null,
+      max: max !== null && !isNaN(max) ? max : null,
+    });
+    setShowYAxisPopup(false);
+  }, [editMin, editMax, onYAxisBoundsChange]);
+
+  // Reset y-axis bounds
+  const handleReset = useCallback(() => {
+    if (!onYAxisBoundsChange) return;
+    onYAxisBoundsChange({ min: null, max: null });
+    setShowYAxisPopup(false);
+  }, [onYAxisBoundsChange]);
+
+  // Expose chart methods via ref
+  useImperativeHandle(ref, () => ({
+    getChartImage: () => {
+      if (!chartInstance.current) return undefined;
+      return chartInstance.current.getDataURL({
+        type: 'png',
+        pixelRatio: 2,
+        backgroundColor: '#fff',
+      });
+    },
+  }), []);
+
+  // Check if data spans multiple years
+  const spansMultipleYears = useMemo(() => {
+    if (!data || data.length < 2) return false;
+    const firstYear = new Date(data[0].date).getFullYear();
+    const lastYear = new Date(data[data.length - 1].date).getFullYear();
+    return firstYear !== lastYear;
+  }, [data]);
+
+  // Format dates for display (include year if data spans multiple years)
+  const formatDate = useCallback((dateStr: string) => {
     const date = new Date(dateStr);
+    if (spansMultipleYears) {
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
+    }
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  };
+  }, [spansMultipleYears]);
 
   // Build chart options
   const chartOptions = useMemo((): EChartsOption => {
@@ -167,6 +278,8 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
       yAxis: {
         type: 'value',
         name: yAxisLabel,
+        min: yAxisBounds?.min ?? undefined,
+        max: yAxisBounds?.max ?? undefined,
         axisLine: { show: false },
         axisTick: { show: false },
         axisLabel: {
@@ -174,6 +287,8 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
           color: '#9ca3af',
         },
         splitLine: { lineStyle: { color: '#d1d5db', type: 'dashed' } },
+        // Indicate clickable area with subtle style when callback exists
+        nameTextStyle: onYAxisBoundsChange ? { color: '#6b7280' } : undefined,
       },
       dataZoom: showDataZoom
         ? [
@@ -190,7 +305,7 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
       },
       series,
     };
-  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter]);
+  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange]);
 
   // Initialize chart
   useEffect(() => {
@@ -216,6 +331,20 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
       chart.dispose();
     };
   }, []);
+
+  // Add click handler to chart container for y-axis clicks
+  useEffect(() => {
+    const container = chartRef.current;
+    if (!container || !onYAxisBoundsChange) return;
+
+    container.addEventListener('click', handleYAxisClick);
+    // Add cursor style hint for y-axis area
+    container.style.cursor = 'default';
+
+    return () => {
+      container.removeEventListener('click', handleYAxisClick);
+    };
+  }, [handleYAxisClick, onYAxisBoundsChange]);
 
   // Update chart options
   useEffect(() => {
@@ -246,6 +375,61 @@ export const TimeSeriesChart = memo(function TimeSeriesChart({
   }
 
   return (
-    <div ref={chartRef} style={{ height, width: '100%' }} className="relative" />
+    <>
+      <div ref={chartRef} style={{ height, width: '100%' }} className="relative" />
+
+      {/* Y-Axis Bounds Popup */}
+      {showYAxisPopup && (
+        <div
+          ref={popupRef}
+          className="fixed z-50 bg-white rounded-lg shadow-xl border border-gray-200 p-4 w-64"
+          style={{
+            left: Math.min(popupPosition.x, window.innerWidth - 280),
+            top: Math.min(popupPosition.y - 80, window.innerHeight - 200),
+          }}
+        >
+          <div className="text-sm font-semibold text-gray-700 mb-3">Y-Axis Range</div>
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500 w-10">Min:</label>
+              <input
+                type="number"
+                value={editMin}
+                onChange={(e) => setEditMin(e.target.value)}
+                placeholder="Auto"
+                className="flex-1 px-2 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                onKeyDown={(e) => e.key === 'Enter' && handleApplyBounds()}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500 w-10">Max:</label>
+              <input
+                type="number"
+                value={editMax}
+                onChange={(e) => setEditMax(e.target.value)}
+                placeholder="Auto"
+                className="flex-1 px-2 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                onKeyDown={(e) => e.key === 'Enter' && handleApplyBounds()}
+              />
+            </div>
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={handleReset}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded hover:bg-gray-200 transition-colors"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Reset to Fit
+              </button>
+              <button
+                onClick={handleApplyBounds}
+                className="flex-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-500 rounded hover:bg-blue-600 transition-colors"
+              >
+                Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
-});
+}));

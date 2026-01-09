@@ -187,6 +187,38 @@ const initSchema = () => {
 
     CREATE INDEX IF NOT EXISTS idx_yield_targets_month ON yield_targets(month);
     CREATE INDEX IF NOT EXISTS idx_yield_targets_bucket ON yield_targets(bucket_name);
+
+    -- Monthly Periods Table (defines period date ranges per month, shared across all buckets)
+    CREATE TABLE IF NOT EXISTS monthly_periods (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      month TEXT NOT NULL,
+      period_number INTEGER NOT NULL,
+      start_day INTEGER NOT NULL,
+      end_day INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(month, period_number)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_periods_month ON monthly_periods(month);
+
+    -- Period Targets Table (yield targets per bucket per period)
+    CREATE TABLE IF NOT EXISTS period_targets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bucket_name TEXT NOT NULL,
+      month TEXT NOT NULL,
+      period_number INTEGER NOT NULL,
+      monthly_plan_target REAL,
+      business_plan_target REAL,
+      monthly_plan_rate REAL,
+      business_plan_rate REAL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(bucket_name, month, period_number)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_period_targets_month ON period_targets(month);
+    CREATE INDEX IF NOT EXISTS idx_period_targets_bucket ON period_targets(bucket_name);
   `);
 };
 

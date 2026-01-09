@@ -85,7 +85,7 @@ export function getSalesData(
   customers?: string[]
 ): SalesDataRow[] {
   let query = `
-    SELECT id, date, product_name, product_desc, customer_name, transaction_type,
+    SELECT id, date, TRIM(product_name) as product_name, product_desc, TRIM(customer_name) as customer_name, transaction_type,
            vol_qty_tr, vol_qty_h2o, vol_qty_pl, vol_qty_os, vol_qty_total
     FROM sales_data
     WHERE date BETWEEN ? AND ?
@@ -112,7 +112,7 @@ export function getSalesData(
 
 export function getSalesProducts(): string[] {
   const stmt = db.prepare(`
-    SELECT DISTINCT product_name
+    SELECT DISTINCT TRIM(product_name) as product_name
     FROM sales_data
     ORDER BY product_name ASC
   `);
@@ -122,7 +122,7 @@ export function getSalesProducts(): string[] {
 
 export function getSalesCustomers(): string[] {
   const stmt = db.prepare(`
-    SELECT DISTINCT customer_name
+    SELECT DISTINCT TRIM(customer_name) as customer_name
     FROM sales_data
     WHERE customer_name IS NOT NULL
     ORDER BY customer_name ASC
