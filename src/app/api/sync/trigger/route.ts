@@ -70,7 +70,9 @@ export async function POST(request: NextRequest) {
 }
 
 // Background sync runner (would be called by scheduler)
-export async function runScheduledSync(dataType: string): Promise<void> {
+// Note: This function is not exported from the API route to satisfy Next.js constraints.
+// If needed externally, move to a separate utility file.
+async function runScheduledSync(dataType: string): Promise<void> {
   if (runningSyncs.get(dataType)) {
     console.log(`Sync for ${dataType} already running, skipping`);
     return;

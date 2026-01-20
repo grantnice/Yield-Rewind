@@ -10,6 +10,7 @@ import {
   LegendComponent,
   DataZoomComponent,
   ToolboxComponent,
+  MarkLineComponent,
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import type { EChartsOption } from 'echarts';
@@ -25,6 +26,7 @@ echarts.use([
   LegendComponent,
   DataZoomComponent,
   ToolboxComponent,
+  MarkLineComponent,
   CanvasRenderer,
 ]);
 
@@ -52,6 +54,13 @@ export interface YAxisBounds {
   max: number | null;
 }
 
+export interface ReferenceLineConfig {
+  value: number;
+  label: string;
+  color?: string;
+  seriesKey?: string; // Optional: associates this line with a specific series
+}
+
 export interface TimeSeriesChartProps {
   data: TimeSeriesDataPoint[];
   seriesKeys: string[];
@@ -66,6 +75,7 @@ export interface TimeSeriesChartProps {
   loading?: boolean;
   yAxisBounds?: YAxisBounds;
   onYAxisBoundsChange?: (bounds: YAxisBounds) => void;
+  referenceLines?: ReferenceLineConfig[];
 }
 
 export interface TimeSeriesChartRef {
@@ -86,6 +96,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   loading = false,
   yAxisBounds,
   onYAxisBoundsChange,
+  referenceLines = [],
 }: TimeSeriesChartProps, ref) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstance = useRef<echarts.ECharts | null>(null);
@@ -179,14 +190,18 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   // Check if data spans multiple years
   const spansMultipleYears = useMemo(() => {
     if (!data || data.length < 2) return false;
-    const firstYear = new Date(data[0].date).getFullYear();
-    const lastYear = new Date(data[data.length - 1].date).getFullYear();
+    // Parse year directly from string to avoid timezone issues
+    const firstYear = parseInt(data[0].date.split('-')[0], 10);
+    const lastYear = parseInt(data[data.length - 1].date.split('-')[0], 10);
     return firstYear !== lastYear;
   }, [data]);
 
   // Format dates for display (include year if data spans multiple years)
+  // Parse as local date to avoid timezone shift (YYYY-MM-DD gets parsed as UTC)
   const formatDate = useCallback((dateStr: string) => {
-    const date = new Date(dateStr);
+    // Split the date string to avoid UTC parsing issues
+    const [year, month, day] = dateStr.split('-').map(Number);
+    const date = new Date(year, month - 1, day); // month is 0-indexed
     if (spansMultipleYears) {
       return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
     }
@@ -199,30 +214,55 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
 
     const dates = data.map((d) => d.date);
 
-    const series = seriesKeys.map((key, index) => {
+    const series: any[] = seriesKeys.map((key, index) => {
       const seriesData = data.map((d) => {
         const value = d[key];
         return typeof value === 'number' ? value : null;
       });
 
       const isBar = chartType === 'bar';
+      const seriesColor = CHART_COLORS[index % CHART_COLORS.length];
+
+      // Find reference lines for this series
+      const seriesRefLines = referenceLines.filter(
+        (rl) => rl.seriesKey === key || (!rl.seriesKey && index === 0)
+      );
 
       return {
         name: seriesLabels[key] || key,
-        type: isBar ? ('bar' as const) : ('line' as const),
+        type: isBar ? 'bar' : 'line',
         data: seriesData,
         smooth: isBar ? undefined : smooth,
         showSymbol: isBar ? undefined : data.length < 100,
         symbolSize: isBar ? undefined : 4,
-        color: CHART_COLORS[index % CHART_COLORS.length],
+        color: seriesColor,
         lineStyle: isBar ? undefined : { width: 2 },
         areaStyle: chartType === 'area' ? { opacity: stacked ? 0.7 : 0.3 } : undefined,
         stack: stacked ? 'total' : undefined,
         barMaxWidth: isBar ? 30 : undefined,
-        sampling: 'lttb' as const,
+        sampling: 'lttb',
         progressive: 200,
         animation: data.length < 500,
         animationDuration: 300,
+        // Add markLine for reference lines associated with this series
+        markLine: seriesRefLines.length > 0 ? {
+          silent: true,
+          symbol: 'none',
+          data: seriesRefLines.map((rl) => ({
+            yAxis: rl.value,
+            label: {
+              formatter: `${rl.label}: {c}`,
+              position: 'insideEndTop',
+              color: rl.color || seriesColor,
+              fontSize: 10,
+            },
+            lineStyle: {
+              color: rl.color || seriesColor,
+              type: 'dashed',
+              width: 2,
+            },
+          })),
+        } : undefined,
       };
     });
 
@@ -305,7 +345,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       },
       series,
     };
-  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange]);
+  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines]);
 
   // Initialize chart
   useEffect(() => {

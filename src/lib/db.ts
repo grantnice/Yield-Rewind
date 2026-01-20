@@ -66,6 +66,33 @@ try {
   // Column already exists, ignore
 }
 
+// Migration: Add audit columns to yield_data for change tracking
+try {
+  db.exec(`ALTER TABLE yield_data ADD COLUMN last_sync_id INTEGER`);
+} catch {
+  // Column already exists, ignore
+}
+try {
+  db.exec(`ALTER TABLE yield_data ADD COLUMN first_synced_at DATETIME`);
+} catch {
+  // Column already exists, ignore
+}
+try {
+  db.exec(`ALTER TABLE yield_data ADD COLUMN last_modified_at DATETIME`);
+} catch {
+  // Column already exists, ignore
+}
+try {
+  db.exec(`ALTER TABLE yield_data ADD COLUMN sync_count INTEGER DEFAULT 1`);
+} catch {
+  // Column already exists, ignore
+}
+try {
+  db.exec(`ALTER TABLE yield_data ADD COLUMN source_hash TEXT`);
+} catch {
+  // Column already exists, ignore
+}
+
 // Initialize schema if needed
 const initSchema = () => {
   db.exec(`
@@ -219,6 +246,71 @@ const initSchema = () => {
 
     CREATE INDEX IF NOT EXISTS idx_period_targets_month ON period_targets(month);
     CREATE INDEX IF NOT EXISTS idx_period_targets_bucket ON period_targets(bucket_name);
+
+    -- Sync Log Table (Detailed audit trail for all sync operations)
+    CREATE TABLE IF NOT EXISTS sync_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      data_type TEXT NOT NULL,
+      sync_mode TEXT NOT NULL,
+      sync_reason TEXT,
+      date_range_start DATE,
+      date_range_end DATE,
+      started_at DATETIME NOT NULL,
+      completed_at DATETIME,
+      status TEXT NOT NULL,
+      records_fetched INTEGER,
+      records_inserted INTEGER,
+      records_updated INTEGER,
+      records_unchanged INTEGER,
+      error_message TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sync_log_data_type ON sync_log(data_type);
+    CREATE INDEX IF NOT EXISTS idx_sync_log_started ON sync_log(started_at);
+    CREATE INDEX IF NOT EXISTS idx_sync_log_status ON sync_log(status);
+
+    -- Yield Data History Table (Change tracking for yield data)
+    CREATE TABLE IF NOT EXISTS yield_data_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_id INTEGER NOT NULL,
+      date DATE NOT NULL,
+      product_name TEXT NOT NULL,
+      product_class TEXT,
+      oi_qty REAL,
+      rec_qty REAL,
+      ship_qty REAL,
+      blend_qty REAL,
+      ci_qty REAL,
+      yield_qty REAL,
+      sync_id INTEGER NOT NULL,
+      captured_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      change_type TEXT NOT NULL,
+      previous_yield_qty REAL,
+      FOREIGN KEY (sync_id) REFERENCES sync_log(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_yield_history_date ON yield_data_history(date);
+    CREATE INDEX IF NOT EXISTS idx_yield_history_sync ON yield_data_history(sync_id);
+    CREATE INDEX IF NOT EXISTS idx_yield_history_product ON yield_data_history(product_name);
+    CREATE INDEX IF NOT EXISTS idx_yield_history_captured ON yield_data_history(captured_at);
+
+    -- Sales Data History Table (Change tracking for sales data)
+    CREATE TABLE IF NOT EXISTS sales_data_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_id INTEGER NOT NULL,
+      date DATE NOT NULL,
+      product_name TEXT NOT NULL,
+      customer_name TEXT,
+      vol_qty_total REAL,
+      sync_id INTEGER NOT NULL,
+      captured_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      change_type TEXT NOT NULL,
+      previous_vol_qty_total REAL,
+      FOREIGN KEY (sync_id) REFERENCES sync_log(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sales_history_date ON sales_data_history(date);
+    CREATE INDEX IF NOT EXISTS idx_sales_history_sync ON sales_data_history(sync_id);
   `);
 };
 

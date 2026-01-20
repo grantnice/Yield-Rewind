@@ -5,7 +5,10 @@ import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { TimeSeriesChart, TimeSeriesChartRef, YAxisBounds } from '@/components/charts/time-series-chart';
+import { SPCChart, YAxisBounds as SPCYAxisBounds } from '@/components/charts/spc-chart';
+import { SPCControls, BaselineMode, MetricOption } from '@/components/charts/spc-controls';
 import { getDaysAgo, getYesterday, getMonthStart, formatNumber } from '@/lib/utils';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 
 // Quick date range options
 const dateRanges = [
@@ -73,6 +76,26 @@ export default function YieldReport() {
 
   // Y-axis bounds state
   const [yAxisBounds, setYAxisBounds] = useState<YAxisBounds>({ min: null, max: null });
+
+  // SPC state
+  const [showSPC, setShowSPC] = useState(false);
+  const [spcSeries, setSpcSeries] = useState<string>(defaultSelections[0]);
+  const [spcMetric, setSpcMetric] = useState<string>('yield_qty');
+  const [spcBaselineMode, setSpcBaselineMode] = useState<BaselineMode>('full');
+  const [spcBaselineDays, setSpcBaselineDays] = useState(30);
+  const [spcEnabledRules, setSpcEnabledRules] = useState<number[]>([1, 2, 3, 4, 5, 6, 7, 8]);
+  const [spcYAxisBounds, setSpcYAxisBounds] = useState<SPCYAxisBounds>({ min: null, max: null });
+
+  // SPC metric options
+  const spcMetricOptions: MetricOption[] = [
+    { key: 'yield_qty', label: 'Yield Value' },
+    { key: 'yield_pct', label: 'Yield %' },
+    { key: 'blend_qty', label: 'Blend' },
+    { key: 'ship_qty', label: 'Ship' },
+    { key: 'rec_qty', label: 'Receipt' },
+    { key: 'oi_qty', label: 'Opening Inventory' },
+    { key: 'ci_qty', label: 'Closing Inventory' },
+  ];
 
   // Chart ref for downloads
   const chartRef = useRef<TimeSeriesChartRef>(null);
@@ -470,6 +493,125 @@ export default function YieldReport() {
     }).filter(Boolean);
   }, [finalChartData, selectedItems]);
 
+  // Prepare SPC data (calculate for any product and any metric from raw API data)
+  const spcData = useMemo(() => {
+    if (!data?.data || !spcSeries) return [];
+
+    // Group raw data by date
+    const byDate: Record<string, Record<string, Record<string, number>>> = {};
+    const byDateClass: Record<string, Record<string, Record<string, number>>> = {};
+
+    data.data.forEach((row: YieldDataRow) => {
+      if (!byDate[row.date]) {
+        byDate[row.date] = {};
+        byDateClass[row.date] = {
+          F: { yield_qty: 0, oi_qty: 0, ci_qty: 0, blend_qty: 0, ship_qty: 0, rec_qty: 0 },
+          P: { yield_qty: 0, oi_qty: 0, ci_qty: 0, blend_qty: 0, ship_qty: 0, rec_qty: 0 },
+        };
+      }
+
+      byDate[row.date][row.product_name] = {
+        yield_qty: row.yield_qty || 0,
+        oi_qty: row.oi_qty || 0,
+        ci_qty: row.ci_qty || 0,
+        blend_qty: row.blend_qty || 0,
+        ship_qty: row.ship_qty || 0,
+        rec_qty: row.rec_qty || 0,
+      };
+
+      const classCode = row.product_class as 'F' | 'P';
+      if (classCode && byDateClass[row.date][classCode]) {
+        byDateClass[row.date][classCode].yield_qty += row.yield_qty || 0;
+        byDateClass[row.date][classCode].oi_qty += row.oi_qty || 0;
+        byDateClass[row.date][classCode].ci_qty += row.ci_qty || 0;
+        byDateClass[row.date][classCode].blend_qty += row.blend_qty || 0;
+        byDateClass[row.date][classCode].ship_qty += row.ship_qty || 0;
+        byDateClass[row.date][classCode].rec_qty += row.rec_qty || 0;
+      }
+    });
+
+    // Get bucket definition if it's a bucket
+    const bucketDef = bucketMap[spcSeries];
+
+    // Calculate value for each date
+    const result: { date: string; value: number }[] = [];
+    const sortedDates = Object.keys(byDate).sort();
+
+    // Filter to display date range
+    const displayStartDate = displayDateRange.start;
+
+    sortedDates.forEach(date => {
+      if (date < displayStartDate) return;
+
+      const products = byDate[date];
+      const classData = byDateClass[date];
+      const crudeRate = -(classData.F?.yield_qty || 0);
+
+      let value = 0;
+
+      if (!bucketDef) {
+        // Individual product
+        const productData = products[spcSeries];
+        if (productData) {
+          if (spcMetric === 'yield_pct') {
+            value = crudeRate !== 0 ? (productData.yield_qty / crudeRate) * 100 : 0;
+          } else {
+            value = productData[spcMetric] || 0;
+          }
+        }
+      } else if (bucketDef[0]?.startsWith('__CLASS:')) {
+        // Class-based aggregation
+        const classCode = bucketDef[0].replace('__CLASS:', '') as 'F' | 'P';
+        if (spcMetric === 'yield_pct') {
+          if (classCode === 'F') {
+            value = 100;
+          } else {
+            value = crudeRate !== 0 ? (classData[classCode]?.yield_qty || 0) / crudeRate * 100 : 0;
+          }
+        } else {
+          const rawValue = classData[classCode]?.[spcMetric] || 0;
+          value = classCode === 'F' ? -rawValue : rawValue;
+        }
+      } else if (bucketDef[0]?.startsWith('__CALC:')) {
+        // Calculated field - Loss
+        if (spcMetric === 'yield_pct') {
+          const nonCrudePct = crudeRate !== 0 ? (classData.P?.yield_qty || 0) / crudeRate * 100 : 0;
+          value = 100 - nonCrudePct;
+        } else {
+          value = -(classData.F?.[spcMetric] || 0) - (classData.P?.[spcMetric] || 0);
+        }
+      } else {
+        // Regular bucket - sum component products
+        if (spcMetric === 'yield_pct') {
+          const bucketYield = bucketDef.reduce((sum, prod) => sum + (products[prod]?.yield_qty || 0), 0);
+          value = crudeRate !== 0 ? (bucketYield / crudeRate) * 100 : 0;
+        } else {
+          value = bucketDef.reduce((sum, prod) => sum + (products[prod]?.[spcMetric] || 0), 0);
+        }
+      }
+
+      if (value !== 0) {
+        result.push({ date, value });
+      }
+    });
+
+    return result;
+  }, [data, spcSeries, spcMetric, bucketMap, displayDateRange]);
+
+  // Calculate baseline range for SPC
+  const spcBaselineRange = useMemo(() => {
+    if (spcBaselineMode === 'full' || !spcData.length) {
+      return undefined;
+    }
+    if (spcBaselineMode === 'first_n') {
+      return {
+        start: 0,
+        end: Math.min(spcBaselineDays - 1, spcData.length - 1),
+      };
+    }
+    return undefined;
+  }, [spcBaselineMode, spcBaselineDays, spcData.length]);
+
   // Download chart as PNG
   const downloadChartPNG = useCallback(() => {
     const dataUrl = chartRef.current?.getChartImage();
@@ -766,6 +908,73 @@ export default function YieldReport() {
               </table>
             </div>
           </CardContent>
+        </Card>
+      )}
+
+      {/* SPC Section */}
+      {finalChartData.length > 0 && (
+        <Card>
+          <CardHeader>
+            <button
+              onClick={() => setShowSPC(!showSPC)}
+              className="flex items-center gap-2 w-full text-left"
+            >
+              {showSPC ? (
+                <ChevronDown className="h-5 w-5 text-gray-500" />
+              ) : (
+                <ChevronRight className="h-5 w-5 text-gray-500" />
+              )}
+              <CardTitle>Statistical Process Control (SPC)</CardTitle>
+              {!showSPC ? (
+                <span className="text-sm font-normal text-gray-500 ml-2">
+                  Click to expand
+                </span>
+              ) : (spcYAxisBounds.min !== null || spcYAxisBounds.max !== null) && (
+                <span className="text-xs font-normal px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded ml-2">
+                  Y: {spcYAxisBounds.min ?? 'auto'} - {spcYAxisBounds.max ?? 'auto'}
+                </span>
+              )}
+            </button>
+          </CardHeader>
+          {showSPC && (
+            <CardContent className="space-y-4">
+              <SPCControls
+                availableBuckets={selectableBuckets}
+                availableProducts={individualProducts}
+                selectedSeries={spcSeries}
+                onSeriesChange={(s) => setSpcSeries(s)}
+                availableMetrics={spcMetricOptions}
+                selectedMetric={spcMetric}
+                onMetricChange={(m) => {
+                  setSpcMetric(m);
+                  setSpcYAxisBounds({ min: null, max: null });
+                }}
+                baselineMode={spcBaselineMode}
+                onBaselineModeChange={setSpcBaselineMode}
+                baselineDays={spcBaselineDays}
+                onBaselineDaysChange={setSpcBaselineDays}
+                enabledRules={spcEnabledRules}
+                onEnabledRulesChange={setSpcEnabledRules}
+              />
+
+              {spcData.length > 0 ? (
+                <SPCChart
+                  data={spcData}
+                  seriesLabel={`${spcSeries} - ${spcMetricOptions.find(m => m.key === spcMetric)?.label || spcMetric}`}
+                  baselineRange={spcBaselineRange}
+                  enabledRules={spcEnabledRules}
+                  height={400}
+                  yAxisFormatter={spcMetric === 'yield_pct' ? (v) => `${v.toFixed(1)}%` : undefined}
+                  yAxisBounds={spcYAxisBounds}
+                  onYAxisBoundsChange={setSpcYAxisBounds}
+                />
+              ) : (
+                <div className="h-[200px] flex items-center justify-center bg-gray-50 rounded-lg">
+                  <p className="text-gray-500">Select a series with data to view SPC analysis</p>
+                </div>
+              )}
+            </CardContent>
+          )}
         </Card>
       )}
     </div>

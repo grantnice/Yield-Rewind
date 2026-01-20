@@ -15,6 +15,7 @@ and stores them in SQLite for instant query response times.
 import argparse
 import sqlite3
 import pyodbc
+import hashlib
 import json
 import os
 import sys
@@ -67,6 +68,80 @@ def get_yesterday():
     return (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 
+def get_prior_month_range() -> tuple:
+    """Get date range for the prior month."""
+    today = datetime.now()
+    first_of_current = today.replace(day=1)
+    last_of_prior = first_of_current - timedelta(days=1)
+    first_of_prior = last_of_prior.replace(day=1)
+    return (first_of_prior.strftime('%Y-%m-%d'), last_of_prior.strftime('%Y-%m-%d'))
+
+
+def compute_source_hash(oi, rec, ship, blend, ci) -> str:
+    """Compute a hash of source values for change detection."""
+    values = f"{oi or 0}|{rec or 0}|{ship or 0}|{blend or 0}|{ci or 0}"
+    return hashlib.md5(values.encode()).hexdigest()[:16]
+
+
+def create_sync_log_entry(conn, data_type: str, sync_mode: str, sync_reason: str,
+                          start_date: str, end_date: str) -> int:
+    """Create a sync_log entry and return its ID."""
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO sync_log (data_type, sync_mode, sync_reason, date_range_start,
+                              date_range_end, started_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'running')
+    ''', (data_type, sync_mode, sync_reason, start_date, end_date, datetime.now().isoformat()))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def update_sync_log_completion(conn, sync_id: int, status: str, records_fetched: int,
+                                records_inserted: int, records_updated: int,
+                                records_unchanged: int, error_message: str = None):
+    """Update sync_log entry on completion."""
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE sync_log SET
+            completed_at = ?,
+            status = ?,
+            records_fetched = ?,
+            records_inserted = ?,
+            records_updated = ?,
+            records_unchanged = ?,
+            error_message = ?
+        WHERE id = ?
+    ''', (datetime.now().isoformat(), status, records_fetched, records_inserted,
+          records_updated, records_unchanged, error_message, sync_id))
+    conn.commit()
+
+
+def capture_yield_history(conn, existing_record: dict, sync_id: int, change_type: str):
+    """Capture a historical snapshot of yield data before update."""
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO yield_data_history
+        (original_id, date, product_name, product_class, oi_qty, rec_qty, ship_qty,
+         blend_qty, ci_qty, yield_qty, sync_id, change_type, previous_yield_qty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        existing_record['id'],
+        existing_record['date'],
+        existing_record['product_name'],
+        existing_record['product_class'],
+        existing_record['oi_qty'],
+        existing_record['rec_qty'],
+        existing_record['ship_qty'],
+        existing_record['blend_qty'],
+        existing_record['ci_qty'],
+        existing_record['yield_qty'],
+        sync_id,
+        change_type,
+        existing_record['yield_qty'],
+    ))
+    conn.commit()
+
+
 def get_date_range(mode: str, data_type: str) -> tuple:
     """
     Calculate date range based on sync mode.
@@ -102,16 +177,18 @@ def get_date_range(mode: str, data_type: str) -> tuple:
     return (start_date, end_date)
 
 
-def sync_yield_data(start_date: str, end_date: str) -> int:
+def sync_yield_data(start_date: str, end_date: str, sync_mode: str = 'incremental',
+                    sync_reason: str = 'scheduled') -> dict:
     """
-    Sync yield data from SQL Server to SQLite.
+    Sync yield data from SQL Server to SQLite with change detection.
 
     Calls the stored procedure for each day in the range and inserts results.
+    Tracks changes and maintains history.
 
     Returns:
-        int: Number of records synced
+        dict: Sync statistics (fetched, inserted, updated, unchanged)
     """
-    print(f"Syncing yield data from {start_date} to {end_date}")
+    print(f"Syncing yield data from {start_date} to {end_date} (mode={sync_mode}, reason={sync_reason})")
 
     sql_conn = get_sql_server_connection()
     sqlite_conn = get_sqlite_connection()
@@ -119,62 +196,121 @@ def sync_yield_data(start_date: str, end_date: str) -> int:
     sql_cursor = sql_conn.cursor()
     sqlite_cursor = sqlite_conn.cursor()
 
+    # Create sync log entry
+    sync_id = create_sync_log_entry(sqlite_conn, 'yield', sync_mode, sync_reason, start_date, end_date)
+
+    stats = {
+        'fetched': 0,
+        'inserted': 0,
+        'updated': 0,
+        'unchanged': 0,
+    }
+
     # Parse dates
     current = datetime.strptime(start_date, '%Y-%m-%d')
     end = datetime.strptime(end_date, '%Y-%m-%d')
 
-    records_synced = 0
+    try:
+        while current <= end:
+            date_str = current.strftime('%Y-%m-%d')
 
-    while current <= end:
-        date_str = current.strftime('%Y-%m-%d')
+            try:
+                # Call stored procedure for this date
+                sql_cursor.execute(f"SET NOCOUNT ON; EXEC {YIELD_SP} @rp_bgn_dte = ?, @rp_end_dte = ?", date_str, date_str)
+                rows = sql_cursor.fetchall()
+                stats['fetched'] += len(rows)
 
-        try:
-            # Call stored procedure for this date (uses begin/end date params)
-            sql_cursor.execute(f"SET NOCOUNT ON; EXEC {YIELD_SP} @rp_bgn_dte = ?, @rp_end_dte = ?", date_str, date_str)
-            rows = sql_cursor.fetchall()
+                for row in rows:
+                    # Product class: 'F' = Feedstock (crude), 'P' = Product (output)
+                    product_class = row[1].strip() if row[1] else None
+                    product_name = row.smry_prdt_nme.strip() if hasattr(row, 'smry_prdt_nme') else str(row[4]).strip()
+                    oi = row.oi_qty if hasattr(row, 'oi_qty') else row[5]
+                    rec = row.rec_qty if hasattr(row, 'rec_qty') else row[6]
+                    ship = row.ship_qty if hasattr(row, 'ship_qty') else row[7]
+                    blend = row.blend_qty if hasattr(row, 'blend_qty') else row[8]
+                    ci = row.ci_qty if hasattr(row, 'ci_qty') else row[9]
 
-            # Delete existing data for this date
-            sqlite_cursor.execute('DELETE FROM yield_data WHERE date = ?', (date_str,))
+                    # Calculate yield and source hash
+                    yield_qty = (blend or 0) + (ci or 0) - (oi or 0) - (rec or 0) + (ship or 0)
+                    source_hash = compute_source_hash(oi, rec, ship, blend, ci)
 
-            # Insert new data (use INSERT OR REPLACE to handle duplicates)
-            # SP columns: [1]prdt_clss_alfa_nme, [4]smry_prdt_nme, [5]oi_qty, [6]rec_qty, [7]ship_qty, [8]blend_qty, [9]ci_qty
-            # Yield calculation: yield = blend + ci - oi - rec + ship
-            for row in rows:
-                # Product class: 'F' = Feedstock (crude), 'P' = Product (output)
-                product_class = row[1].strip() if row[1] else None
-                oi = row.oi_qty if hasattr(row, 'oi_qty') else row[5]
-                rec = row.rec_qty if hasattr(row, 'rec_qty') else row[6]
-                ship = row.ship_qty if hasattr(row, 'ship_qty') else row[7]
-                blend = row.blend_qty if hasattr(row, 'blend_qty') else row[8]
-                ci = row.ci_qty if hasattr(row, 'ci_qty') else row[9]
+                    # Check for existing record
+                    sqlite_cursor.execute('''
+                        SELECT id, source_hash, sync_count, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty,
+                               yield_qty, product_class, date, product_name
+                        FROM yield_data WHERE date = ? AND product_name = ?
+                    ''', (date_str, product_name))
+                    existing = sqlite_cursor.fetchone()
 
-                # Calculate yield: blend + close - open - rec + ship
-                yield_qty = (blend or 0) + (ci or 0) - (oi or 0) - (rec or 0) + (ship or 0)
+                    if existing:
+                        existing_dict = dict(existing)
+                        if existing_dict.get('source_hash') == source_hash:
+                            # No change
+                            stats['unchanged'] += 1
+                            continue
+                        else:
+                            # Record changed - capture history
+                            change_type = 'prior_month_refresh' if sync_mode == 'prior_month_refresh' else 'update'
+                            capture_yield_history(sqlite_conn, existing_dict, sync_id, change_type)
+                            stats['updated'] += 1
+                            sync_count = (existing_dict.get('sync_count') or 1) + 1
+                            first_synced = None  # Keep existing
+                    else:
+                        stats['inserted'] += 1
+                        sync_count = 1
+                        first_synced = datetime.now().isoformat()
 
-                sqlite_cursor.execute('''
-                    INSERT OR REPLACE INTO yield_data
-                    (date, product_name, product_class, oi_qty, rec_qty, ship_qty, blend_qty, ci_qty, yield_qty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    date_str,
-                    row.smry_prdt_nme.strip() if hasattr(row, 'smry_prdt_nme') else str(row[4]).strip(),
-                    product_class,
-                    oi, rec, ship, blend, ci, yield_qty,
-                ))
-                records_synced += 1
+                    # Insert/update record with audit fields
+                    if existing:
+                        sqlite_cursor.execute('''
+                            UPDATE yield_data SET
+                                product_class = ?, oi_qty = ?, rec_qty = ?, ship_qty = ?,
+                                blend_qty = ?, ci_qty = ?, yield_qty = ?, last_sync_id = ?,
+                                last_modified_at = ?, sync_count = ?, source_hash = ?
+                            WHERE id = ?
+                        ''', (
+                            product_class, oi, rec, ship, blend, ci, yield_qty, sync_id,
+                            datetime.now().isoformat(), sync_count, source_hash, existing_dict['id']
+                        ))
+                    else:
+                        sqlite_cursor.execute('''
+                            INSERT INTO yield_data
+                            (date, product_name, product_class, oi_qty, rec_qty, ship_qty,
+                             blend_qty, ci_qty, yield_qty, last_sync_id, first_synced_at,
+                             last_modified_at, sync_count, source_hash)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            date_str, product_name, product_class, oi, rec, ship, blend, ci,
+                            yield_qty, sync_id, first_synced, datetime.now().isoformat(),
+                            sync_count, source_hash
+                        ))
 
-            sqlite_conn.commit()
-            print(f"  {date_str}: {len(rows)} records")
+                sqlite_conn.commit()
+                day_changes = stats['inserted'] + stats['updated'] - (stats.get('prev_changes') or 0)
+                stats['prev_changes'] = stats['inserted'] + stats['updated']
+                print(f"  {date_str}: {len(rows)} fetched, {day_changes} changed")
 
-        except Exception as e:
-            print(f"  {date_str}: Error - {e}")
+            except Exception as e:
+                print(f"  {date_str}: Error - {e}")
 
-        current += timedelta(days=1)
+            current += timedelta(days=1)
 
-    sql_conn.close()
-    sqlite_conn.close()
+        # Update sync log with success
+        update_sync_log_completion(sqlite_conn, sync_id, 'success',
+                                   stats['fetched'], stats['inserted'],
+                                   stats['updated'], stats['unchanged'])
 
-    return records_synced
+    except Exception as e:
+        update_sync_log_completion(sqlite_conn, sync_id, 'failed',
+                                   stats['fetched'], stats['inserted'],
+                                   stats['updated'], stats['unchanged'], str(e))
+        raise
+
+    finally:
+        sql_conn.close()
+        sqlite_conn.close()
+
+    return stats
 
 
 def sync_sales_data(start_date: str, end_date: str) -> int:
@@ -356,14 +492,23 @@ def main():
     parser = argparse.ArgumentParser(description='Sync data from SQL Server to SQLite')
     parser.add_argument('--type', choices=['yield', 'sales', 'tank', 'all'], default='all',
                         help='Type of data to sync')
-    parser.add_argument('--mode', choices=['full', 'incremental'], default='incremental',
+    parser.add_argument('--mode', choices=['full', 'incremental', 'prior_month_refresh'], default='incremental',
                         help='Sync mode')
+    parser.add_argument('--prior-month', action='store_true',
+                        help='Refresh prior month data (shortcut for --mode prior_month_refresh)')
+    parser.add_argument('--refresh-reason', choices=['manual', 'manual_mtd', 'mtd_full_refresh', 'scheduled', 'day_5_refresh', 'day_10_refresh'],
+                        default='scheduled', help='Reason for sync (for audit trail)')
     parser.add_argument('--start-date', help='Override start date (YYYY-MM-DD)')
     parser.add_argument('--end-date', help='Override end date (YYYY-MM-DD)')
 
     args = parser.parse_args()
 
-    print(f"Starting sync: type={args.type}, mode={args.mode}")
+    # Handle --prior-month shortcut
+    sync_mode = args.mode
+    if args.prior_month:
+        sync_mode = 'prior_month_refresh'
+
+    print(f"Starting sync: type={args.type}, mode={sync_mode}, reason={args.refresh_reason}")
     print(f"SQLite DB: {SQLITE_DB_PATH}")
 
     data_types = ['yield', 'sales', 'tank'] if args.type == 'all' else [args.type]
@@ -379,8 +524,11 @@ def main():
             # Get date range
             if args.start_date and args.end_date:
                 start_date, end_date = args.start_date, args.end_date
+            elif sync_mode == 'prior_month_refresh':
+                start_date, end_date = get_prior_month_range()
+                print(f"Prior month refresh: {start_date} to {end_date}")
             else:
-                start_date, end_date = get_date_range(args.mode, data_type)
+                start_date, end_date = get_date_range(sync_mode, data_type)
 
             # Skip if no dates to sync
             if start_date > end_date:
@@ -389,7 +537,9 @@ def main():
 
             # Run appropriate sync function
             if data_type == 'yield':
-                records = sync_yield_data(start_date, end_date)
+                result = sync_yield_data(start_date, end_date, sync_mode, args.refresh_reason)
+                records = result['fetched']
+                print(f"\n  Stats: {result['inserted']} inserted, {result['updated']} updated, {result['unchanged']} unchanged")
             elif data_type == 'sales':
                 records = sync_sales_data(start_date, end_date)
             elif data_type == 'tank':
@@ -399,7 +549,7 @@ def main():
 
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
-            # Update status
+            # Update legacy sync_status table for backward compatibility
             update_sync_status(data_type, 'success', records, duration_ms)
             print(f"\n[OK] {data_type} sync complete: {records} records in {duration_ms}ms")
 

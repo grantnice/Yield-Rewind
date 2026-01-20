@@ -4,7 +4,8 @@ import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { PeriodManagerModal } from '@/components/periods/period-manager-modal';
 import { PeriodTabs } from '@/components/periods/period-tabs';
-import { Settings2 } from 'lucide-react';
+import { FreshnessBadge, PriorMonthStatus } from '@/components/audit/freshness-badge';
+import { Settings2, RefreshCw } from 'lucide-react';
 
 // Get month options for the last 12 months
 function getMonthOptions() {
@@ -175,6 +176,8 @@ export default function MonthlyYieldTable() {
   const [rollingDays, setRollingDays] = useState(2);
   const [periodModalOpen, setPeriodModalOpen] = useState(false);
   const [selectedPeriod, setSelectedPeriod] = useState<number | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshStatus, setRefreshStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle');
 
   // Fetch periods configuration for the month
   const { data: periodsData } = useQuery({
@@ -492,6 +495,64 @@ export default function MonthlyYieldTable() {
     setEditTargets([]);
   }, []);
 
+  // Refresh MTD data (full refresh from source)
+  const handleRefreshMTD = useCallback(async () => {
+    setIsRefreshing(true);
+    setRefreshStatus('running');
+
+    try {
+      // Trigger full MTD refresh
+      const res = await fetch(`/api/sync/mtd?data_type=yield&full_refresh=true&month=${selectedMonth.value}`, {
+        method: 'POST',
+      });
+
+      if (!res.ok) {
+        throw new Error('Failed to start refresh');
+      }
+
+      const data = await res.json();
+      const syncId = data.syncId;
+
+      // Poll for completion
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`/api/sync/mtd?sync_id=${syncId}`);
+          const statusData = await statusRes.json();
+
+          if (statusData.sync?.status === 'success') {
+            clearInterval(pollInterval);
+            setRefreshStatus('success');
+            setIsRefreshing(false);
+            // Invalidate queries to refresh data
+            queryClient.invalidateQueries({ queryKey: ['yield-mtd'] });
+            queryClient.invalidateQueries({ queryKey: ['yield-trajectory'] });
+            setTimeout(() => setRefreshStatus('idle'), 3000);
+          } else if (statusData.sync?.status === 'failed') {
+            clearInterval(pollInterval);
+            setRefreshStatus('error');
+            setIsRefreshing(false);
+            setTimeout(() => setRefreshStatus('idle'), 5000);
+          }
+        } catch {
+          // Keep polling on transient errors
+        }
+      }, 2000);
+
+      // Timeout after 2 minutes
+      setTimeout(() => {
+        clearInterval(pollInterval);
+        if (isRefreshing) {
+          setRefreshStatus('error');
+          setIsRefreshing(false);
+        }
+      }, 120000);
+    } catch {
+      setRefreshStatus('error');
+      setIsRefreshing(false);
+      setTimeout(() => setRefreshStatus('idle'), 5000);
+    }
+  }, [selectedMonth.value, queryClient, isRefreshing]);
+
   const isLoading = mtdLoading || targetsLoading;
 
   return (
@@ -565,6 +626,41 @@ export default function MonthlyYieldTable() {
 
           {/* Action Buttons */}
           <div className="flex items-center gap-3">
+            {/* Refresh MTD Status */}
+            {refreshStatus === 'running' && (
+              <span className="text-sm text-blue-600 flex items-center gap-2">
+                <RefreshCw className="h-4 w-4 animate-spin" />
+                Refreshing MTD...
+              </span>
+            )}
+            {refreshStatus === 'success' && (
+              <span className="text-sm text-emerald-600 flex items-center gap-2">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                Data refreshed
+              </span>
+            )}
+            {refreshStatus === 'error' && (
+              <span className="text-sm text-rose-600">Refresh failed</span>
+            )}
+
+            {/* Refresh MTD Button */}
+            <button
+              onClick={handleRefreshMTD}
+              disabled={isRefreshing || isEditing}
+              className={`flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-colors shadow-sm ${
+                isRefreshing || isEditing
+                  ? 'text-gray-400 bg-gray-100 cursor-not-allowed'
+                  : 'text-blue-700 bg-blue-50 border border-blue-200 hover:bg-blue-100 hover:border-blue-300'
+              }`}
+              title="Re-fetch all MTD data from source to pick up any corrections"
+            >
+              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+              Refresh MTD
+            </button>
+
+            {/* Save Status */}
             {saveStatus === 'saving' && (
               <span className="text-sm text-gray-500 flex items-center gap-2">
                 <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
@@ -661,12 +757,14 @@ export default function MonthlyYieldTable() {
         {/* Meta Info */}
         {mtdData?.meta && (
           <div className="flex items-center gap-6 mb-6 text-xs text-gray-500 font-mono-data uppercase tracking-wide">
+            <FreshnessBadge dataType="yield" month={selectedMonth.value} />
             <span className="flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-sm shadow-emerald-500/50" />
               Data through {mtdData.meta.end_date}
             </span>
             <span>{dayCount} operating days</span>
             <span>{mtdData.meta.query_time_ms}ms</span>
+            <PriorMonthStatus month={selectedMonth.value} />
           </div>
         )}
 

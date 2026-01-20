@@ -6,6 +6,7 @@ import { SyncIndicator } from '@/components/sync/sync-indicator';
 const pageTitles: Record<string, string> = {
   '/': 'Dashboard',
   '/yield': 'Yield Report',
+  '/weekly-yield': 'Weekly Yield Look Back',
   '/sales': 'Sales Report',
   '/tanks': 'Tank Inventory',
   '/monthly-yield': 'Monthly Yield Table',

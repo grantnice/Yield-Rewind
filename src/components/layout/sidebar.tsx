@@ -6,22 +6,26 @@ import { cn } from '@/lib/utils';
 import {
   LayoutDashboard,
   TrendingUp,
+  CalendarDays,
   ShoppingCart,
   Droplets,
   Table,
   Settings,
   RefreshCw,
+  Shield,
 } from 'lucide-react';
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Yield Report', href: '/yield', icon: TrendingUp },
+  { name: 'Weekly Yield', href: '/weekly-yield', icon: CalendarDays },
   { name: 'Sales Report', href: '/sales', icon: ShoppingCart },
   { name: 'Tank Inventory', href: '/tanks', icon: Droplets },
   { name: 'Monthly Yield', href: '/monthly-yield', icon: Table },
 ];
 
 const settingsNav = [
+  { name: 'Data Audit', href: '/audit', icon: Shield },
   { name: 'Settings', href: '/settings', icon: Settings },
 ];
 

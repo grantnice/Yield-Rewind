@@ -15,6 +15,11 @@
 import * as schedule from 'node-schedule';
 import { spawn } from 'child_process';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+// ES Module compatible __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const SYNC_SCRIPT = path.join(__dirname, 'sync-worker.py');
 
@@ -22,33 +27,38 @@ interface SyncJob {
   name: string;
   schedule: string;
   dataType: 'yield' | 'sales' | 'tank' | 'all';
-  mode: 'incremental' | 'full';
+  mode: 'incremental' | 'full' | 'prior_month_refresh';
+  reason?: 'scheduled' | 'day_5_refresh' | 'day_10_refresh';
 }
 
 const SYNC_JOBS: SyncJob[] = [
   {
-    name: 'Incremental Yield Sync',
-    schedule: '*/15 * * * *', // Every 15 minutes
-    dataType: 'yield',
-    mode: 'incremental',
-  },
-  {
-    name: 'Incremental Sales Sync',
-    schedule: '5,20,35,50 * * * *', // Every 15 minutes, offset by 5
-    dataType: 'sales',
-    mode: 'incremental',
-  },
-  {
-    name: 'Incremental Tank Sync',
-    schedule: '10,25,40,55 * * * *', // Every 15 minutes, offset by 10
-    dataType: 'tank',
-    mode: 'incremental',
-  },
-  {
-    name: 'Daily Full Sync',
-    schedule: '0 2 * * *', // 2:00 AM daily
+    name: 'Morning Sync (10 AM)',
+    schedule: '0 10 * * *', // 10:00 AM daily
     dataType: 'all',
-    mode: 'full',
+    mode: 'incremental',
+    reason: 'scheduled',
+  },
+  {
+    name: 'Evening Sync (10 PM)',
+    schedule: '0 22 * * *', // 10:00 PM daily
+    dataType: 'all',
+    mode: 'incremental',
+    reason: 'scheduled',
+  },
+  {
+    name: 'Prior Month Day 5 Refresh',
+    schedule: '0 3 5 * *', // 3:00 AM on 5th of each month
+    dataType: 'all',
+    mode: 'prior_month_refresh',
+    reason: 'day_5_refresh',
+  },
+  {
+    name: 'Prior Month Day 10 Refresh',
+    schedule: '0 3 10 * *', // 3:00 AM on 10th of each month
+    dataType: 'all',
+    mode: 'prior_month_refresh',
+    reason: 'day_10_refresh',
   },
 ];
 
@@ -58,7 +68,11 @@ const runningSyncs = new Map<string, boolean>();
 /**
  * Run the Python sync worker
  */
-async function runSync(dataType: string, mode: string): Promise<void> {
+async function runSync(
+  dataType: string,
+  mode: string,
+  reason: string = 'scheduled'
+): Promise<void> {
   const syncKey = `${dataType}-${mode}`;
 
   if (runningSyncs.get(syncKey)) {
@@ -67,15 +81,23 @@ async function runSync(dataType: string, mode: string): Promise<void> {
   }
 
   runningSyncs.set(syncKey, true);
-  console.log(`[Scheduler] Starting ${mode} sync for ${dataType}`);
+  console.log(`[Scheduler] Starting ${mode} sync for ${dataType} (reason: ${reason})`);
+
+  // Build command arguments
+  const args = [SYNC_SCRIPT, '--type', dataType, '--mode', mode, '--refresh-reason', reason];
+
+  // Add --prior-month flag for prior month refresh mode
+  if (mode === 'prior_month_refresh') {
+    args.push('--prior-month');
+  }
 
   return new Promise((resolve, reject) => {
-    const process = spawn('python', [SYNC_SCRIPT, '--type', dataType, '--mode', mode], {
+    const syncProcess = spawn('python', args, {
       cwd: path.dirname(SYNC_SCRIPT),
       stdio: 'inherit',
     });
 
-    process.on('close', (code) => {
+    syncProcess.on('close', (code) => {
       runningSyncs.delete(syncKey);
       if (code === 0) {
         console.log(`[Scheduler] Sync ${syncKey} completed successfully`);
@@ -86,7 +108,7 @@ async function runSync(dataType: string, mode: string): Promise<void> {
       }
     });
 
-    process.on('error', (err) => {
+    syncProcess.on('error', (err) => {
       runningSyncs.delete(syncKey);
       console.error(`[Scheduler] Sync ${syncKey} error:`, err);
       reject(err);
@@ -104,7 +126,7 @@ export function startScheduler(): void {
     schedule.scheduleJob(job.schedule, async () => {
       console.log(`[Scheduler] Running job: ${job.name}`);
       try {
-        await runSync(job.dataType, job.mode);
+        await runSync(job.dataType, job.mode, job.reason || 'scheduled');
       } catch (error) {
         console.error(`[Scheduler] Job ${job.name} failed:`, error);
       }
@@ -129,14 +151,29 @@ export function stopScheduler(): void {
  */
 export async function triggerSync(
   dataType: 'yield' | 'sales' | 'tank' | 'all',
-  mode: 'incremental' | 'full' = 'incremental'
+  mode: 'incremental' | 'full' | 'prior_month_refresh' = 'incremental',
+  reason: 'manual' | 'scheduled' | 'day_5_refresh' | 'day_10_refresh' = 'manual'
 ): Promise<void> {
-  console.log(`[Scheduler] Manual trigger: ${dataType} ${mode}`);
-  await runSync(dataType, mode);
+  console.log(`[Scheduler] Manual trigger: ${dataType} ${mode} (reason: ${reason})`);
+  await runSync(dataType, mode, reason);
+}
+
+/**
+ * Trigger prior month refresh (convenience function)
+ */
+export async function triggerPriorMonthRefresh(
+  dataType: 'yield' | 'sales' | 'tank' | 'all' = 'all'
+): Promise<void> {
+  console.log(`[Scheduler] Prior month refresh triggered for ${dataType}`);
+  await runSync(dataType, 'prior_month_refresh', 'manual');
 }
 
 // Run standalone if executed directly
-if (require.main === module) {
+// Check if this script is the main entry point
+const scriptPath = process.argv[1];
+const isMainModule = scriptPath && (scriptPath.endsWith('scheduler.ts') || scriptPath.endsWith('scheduler.js'));
+
+if (isMainModule) {
   console.log('Starting Yield-Rewind Sync Scheduler');
   console.log('Press Ctrl+C to exit\n');
 
