@@ -59,6 +59,13 @@ export interface ReferenceLineConfig {
   label: string;
   color?: string;
   seriesKey?: string; // Optional: associates this line with a specific series
+  startDate?: string; // Optional: start date for segmented line (YYYY-MM-DD)
+  endDate?: string;   // Optional: end date for segmented line (YYYY-MM-DD)
+}
+
+export interface PeriodBoundary {
+  date: string;  // The date at which period ends (YYYY-MM-DD)
+  label: string; // Label like "P1" or "Period 1"
 }
 
 export interface TimeSeriesChartProps {
@@ -76,6 +83,9 @@ export interface TimeSeriesChartProps {
   yAxisBounds?: YAxisBounds;
   onYAxisBoundsChange?: (bounds: YAxisBounds) => void;
   referenceLines?: ReferenceLineConfig[];
+  secondaryAxisKeys?: string[]; // Series to show on right y-axis
+  secondaryAxisLabel?: string;
+  periodBoundaries?: PeriodBoundary[]; // Vertical lines marking period transitions
 }
 
 export interface TimeSeriesChartRef {
@@ -97,6 +107,9 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   yAxisBounds,
   onYAxisBoundsChange,
   referenceLines = [],
+  secondaryAxisKeys = [],
+  secondaryAxisLabel,
+  periodBoundaries = [],
 }: TimeSeriesChartProps, ref) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstance = useRef<echarts.ECharts | null>(null);
@@ -214,6 +227,8 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
 
     const dates = data.map((d) => d.date);
 
+    const hasSecondaryAxis = secondaryAxisKeys.length > 0;
+
     const series: any[] = seriesKeys.map((key, index) => {
       const seriesData = data.map((d) => {
         const value = d[key];
@@ -222,11 +237,81 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
 
       const isBar = chartType === 'bar';
       const seriesColor = CHART_COLORS[index % CHART_COLORS.length];
+      const isSecondary = secondaryAxisKeys.includes(key);
 
       // Find reference lines for this series
       const seriesRefLines = referenceLines.filter(
         (rl) => rl.seriesKey === key || (!rl.seriesKey && index === 0)
       );
+
+      // Build markLine data
+      const markLineData: any[] = [];
+
+      // Add reference lines (horizontal)
+      seriesRefLines.forEach((rl) => {
+        if (rl.startDate && rl.endDate) {
+          // Segmented line
+          markLineData.push([
+            {
+              xAxis: rl.startDate,
+              yAxis: rl.value,
+              label: {
+                formatter: `${rl.label}: ${rl.value.toFixed(1)}`,
+                position: 'insideEndTop',
+                color: rl.color || seriesColor,
+                fontSize: 10,
+              },
+              lineStyle: {
+                color: rl.color || seriesColor,
+                type: 'dashed',
+                width: 2,
+              },
+            },
+            {
+              xAxis: rl.endDate,
+              yAxis: rl.value,
+            },
+          ]);
+        } else {
+          // Full-width line
+          markLineData.push({
+            yAxis: rl.value,
+            label: {
+              formatter: `${rl.label}: {c}`,
+              position: 'insideEndTop',
+              color: rl.color || seriesColor,
+              fontSize: 10,
+            },
+            lineStyle: {
+              color: rl.color || seriesColor,
+              type: 'dashed',
+              width: 2,
+            },
+          });
+        }
+      });
+
+      // Add period boundaries (vertical lines) - only on first series
+      if (index === 0 && periodBoundaries.length > 0) {
+        periodBoundaries.forEach((boundary) => {
+          markLineData.push({
+            xAxis: boundary.date,
+            label: {
+              formatter: boundary.label ? `${boundary.label} end` : '',
+              position: 'insideEndTop',
+              color: '#9ca3af',
+              fontSize: 9,
+              backgroundColor: 'rgba(255,255,255,0.8)',
+              padding: [2, 4],
+            },
+            lineStyle: {
+              color: '#d1d5db',
+              type: 'dashed',
+              width: 1,
+            },
+          });
+        });
+      }
 
       return {
         name: seriesLabels[key] || key,
@@ -240,28 +325,16 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
         areaStyle: chartType === 'area' ? { opacity: stacked ? 0.7 : 0.3 } : undefined,
         stack: stacked ? 'total' : undefined,
         barMaxWidth: isBar ? 30 : undefined,
+        yAxisIndex: isSecondary ? 1 : 0, // Secondary series go to right y-axis
         sampling: 'lttb',
         progressive: 200,
         animation: data.length < 500,
         animationDuration: 300,
-        // Add markLine for reference lines associated with this series
-        markLine: seriesRefLines.length > 0 ? {
+        // Add markLine for reference lines and period boundaries
+        markLine: markLineData.length > 0 ? {
           silent: true,
           symbol: 'none',
-          data: seriesRefLines.map((rl) => ({
-            yAxis: rl.value,
-            label: {
-              formatter: `${rl.label}: {c}`,
-              position: 'insideEndTop',
-              color: rl.color || seriesColor,
-              fontSize: 10,
-            },
-            lineStyle: {
-              color: rl.color || seriesColor,
-              type: 'dashed',
-              width: 2,
-            },
-          })),
+          data: markLineData,
         } : undefined,
       };
     });
@@ -270,7 +343,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       animation: data.length < 500,
       grid: {
         left: '3%',
-        right: '4%',
+        right: hasSecondaryAxis ? '8%' : '4%', // More space for secondary y-axis
         bottom: showDataZoom ? '22%' : '15%',
         top: '10%',
         containLabel: true,
@@ -287,11 +360,16 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
           const items = params
             .filter((p: any) => p.value != null && p.value !== 0)
             .map((p: any) => {
-              // Check if this looks like a percentage (small values, likely yield_pct)
-              const isPercent = yAxisLabel?.includes('%');
-              const formatted = isPercent
-                ? p.value.toFixed(1) + '%'
-                : Math.round(p.value).toLocaleString();
+              // Check if this series is on the secondary axis (by matching series name)
+              const seriesKey = seriesKeys.find(k => (seriesLabels[k] || k) === p.seriesName) || p.seriesName;
+              const isSecondaryAxisSeries = secondaryAxisKeys.includes(seriesKey);
+
+              // Secondary axis series show as BBL, primary as percentage (if yAxisLabel includes %)
+              const formatted = isSecondaryAxisSeries
+                ? Math.round(p.value).toLocaleString() + ' BBL'
+                : yAxisLabel?.includes('%')
+                  ? p.value.toFixed(1) + '%'
+                  : Math.round(p.value).toLocaleString();
               return `${p.marker} ${p.seriesName}: <strong>${formatted}</strong>`;
             })
             .join('<br/>');
@@ -306,7 +384,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       xAxis: {
         type: 'category',
         data: dates,
-        boundaryGap: false,
+        boundaryGap: chartType === 'bar', // Bar charts need gap, line charts don't
         axisLine: { show: false },
         axisTick: { show: false },
         axisLabel: {
@@ -315,7 +393,35 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
           interval: data.length > 90 ? Math.floor(data.length / 12) : 'auto',
         },
       },
-      yAxis: {
+      yAxis: hasSecondaryAxis ? [
+        {
+          type: 'value',
+          name: yAxisLabel,
+          min: yAxisBounds?.min ?? undefined,
+          max: yAxisBounds?.max ?? undefined,
+          axisLine: { show: false },
+          axisTick: { show: false },
+          axisLabel: {
+            formatter: yAxisFormatter || ((value: number) => value.toLocaleString()),
+            color: '#9ca3af',
+          },
+          splitLine: { lineStyle: { color: '#d1d5db', type: 'dashed' } },
+          nameTextStyle: onYAxisBoundsChange ? { color: '#6b7280' } : undefined,
+        },
+        {
+          type: 'value',
+          name: secondaryAxisLabel,
+          position: 'right',
+          axisLine: { show: false },
+          axisTick: { show: false },
+          axisLabel: {
+            formatter: (value: number) => value.toLocaleString(),
+            color: '#9ca3af',
+          },
+          splitLine: { show: false }, // Don't duplicate grid lines
+          nameTextStyle: { color: '#6b7280' },
+        },
+      ] : {
         type: 'value',
         name: yAxisLabel,
         min: yAxisBounds?.min ?? undefined,
@@ -345,7 +451,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       },
       series,
     };
-  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines]);
+  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines, secondaryAxisKeys, secondaryAxisLabel, periodBoundaries]);
 
   // Initialize chart
   useEffect(() => {

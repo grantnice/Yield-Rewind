@@ -1,16 +1,49 @@
 'use client';
 
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef, Fragment } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { PeriodManagerModal } from '@/components/periods/period-manager-modal';
 import { PeriodTabs } from '@/components/periods/period-tabs';
 import { FreshnessBadge, PriorMonthStatus } from '@/components/audit/freshness-badge';
-import { Settings2, RefreshCw } from 'lucide-react';
+import { Settings2, RefreshCw, ClipboardPaste, Download, Image } from 'lucide-react';
+import html2canvas from 'html2canvas';
+import { PasteTargetsModal } from '@/components/targets/paste-targets-modal';
 
-// Get month options for the last 12 months
+// Get month options for the last 12 months (quick-access buttons)
 function getMonthOptions() {
   const options = [];
   const now = new Date();
+  for (let i = 0; i < 12; i++) {
+    const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    options.push({
+      label: date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+      shortLabel: date.toLocaleDateString('en-US', { month: 'short' }),
+      value: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`,
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+    });
+  }
+  return options;
+}
+
+// Get all months: last 12 + remaining months through end of year
+function getAllMonthOptions() {
+  const options = [];
+  const now = new Date();
+
+  // Future months remaining in this year
+  for (let i = 1; now.getMonth() + i <= 11; i++) {
+    const date = new Date(now.getFullYear(), now.getMonth() + i, 1);
+    options.push({
+      label: date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+      shortLabel: date.toLocaleDateString('en-US', { month: 'short' }),
+      value: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`,
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+    });
+  }
+
+  // Current month + last 12 months
   for (let i = 0; i < 12; i++) {
     const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
     options.push({
@@ -55,6 +88,14 @@ const STATUS_THRESHOLDS = {
   bad: 2,     // More than 2 percentage points off
 };
 
+// Tighter thresholds for 'lower is better' buckets (Loss, LPG, VTB)
+// These are small % buckets where even small deviations are significant
+const LOWER_THRESHOLDS = {
+  good: 0,
+  warning: 0.1,  // Within 0.1 percentage point above target
+  bad: 0.25,     // More than 0.25 percentage points above target
+};
+
 // Direction preference for each bucket
 // 'higher' = above target is good (green), below is bad (red)
 // 'lower' = below target is good (green), above is bad (red)
@@ -72,6 +113,7 @@ const BUCKET_DIRECTION: Record<string, DirectionPreference> = {
   'PBOB': 'higher',
   'Loss': 'lower',
   'LPG': 'lower',
+  'Commercial LPG': 'lower',
   'VTB': 'lower',
   'CBOB': 'near',
 };
@@ -89,8 +131,9 @@ function getStatus(variance: number | null, bucketName: string): 'good' | 'warni
     return 'bad';
   } else if (direction === 'lower') {
     // Below target = good, above = bad
-    if (variance <= STATUS_THRESHOLDS.good) return 'good';
-    if (variance <= STATUS_THRESHOLDS.warning) return 'warning';
+    // Use tighter thresholds for small % buckets like Loss
+    if (variance <= LOWER_THRESHOLDS.good) return 'good';
+    if (variance <= LOWER_THRESHOLDS.warning) return 'warning';
     return 'bad';
   } else {
     // Near target = good, far = bad (either direction)
@@ -169,6 +212,7 @@ interface Period {
 export default function MonthlyYieldTable() {
   const queryClient = useQueryClient();
   const monthOptions = getMonthOptions();
+  const allMonthOptions = getAllMonthOptions();
   const [selectedMonth, setSelectedMonth] = useState(monthOptions[0]);
   const [isEditing, setIsEditing] = useState(false);
   const [editTargets, setEditTargets] = useState<EditableTarget[]>([]);
@@ -178,6 +222,9 @@ export default function MonthlyYieldTable() {
   const [selectedPeriod, setSelectedPeriod] = useState<number | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshStatus, setRefreshStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle');
+  const [pasteModalOpen, setPasteModalOpen] = useState(false);
+  const [lpgExpanded, setLpgExpanded] = useState(false);
+  const tableRef = useRef<HTMLDivElement>(null);
 
   // Fetch periods configuration for the month
   const { data: periodsData } = useQuery({
@@ -349,6 +396,14 @@ export default function MonthlyYieldTable() {
   const crudeRatePlanRate = crudeRateTarget?.monthly_plan_rate || null;
   const crudeRateBpRate = crudeRateTarget?.business_plan_rate || null;
 
+  // Get UMO VGO targets for Base Oil calculation
+  const umoVgoTarget = targetsLookup['UMO VGO'];
+  const umoVgoPlanRate = umoVgoTarget?.monthly_plan_rate || null;
+  const umoVgoBpRate = umoVgoTarget?.business_plan_rate || null;
+
+  // Get UMO VGO actual daily avg for Base Oil actual % calculation
+  const umoVgoDailyAvg = Math.abs(mtdData?.data?.find((b: BucketMTD) => b.bucket_name === 'UMO VGO')?.mtd_daily_avg || 0);
+
   // Combine MTD data with targets
   const tableData = useMemo(() => {
     if (!mtdData?.data) return [];
@@ -356,47 +411,61 @@ export default function MonthlyYieldTable() {
     return mtdData.data.map((bucket: BucketMTD) => {
       const target = targetsLookup[bucket.bucket_name];
       const isCrudeRate = bucket.bucket_name === 'Crude Rate';
+      const isUmoVgo = bucket.bucket_name === 'UMO VGO';
+      const isBaseOil = bucket.bucket_name === 'Base Oil';
+      const isFeedstock = isCrudeRate || isUmoVgo; // Feedstocks don't have % yields
 
       // Use absolute value for display (crude can be negative in some accounting)
       const displayValue = Math.abs(bucket.mtd_daily_avg);
 
-      // Calculate actual yield percentage (bucket daily avg / crude rate daily avg)
-      const actualPct = isCrudeRate ? null : crudeRateDailyAvg > 0
-        ? (Math.abs(bucket.mtd_daily_avg) / crudeRateDailyAvg) * 100
-        : null;
+      // Calculate actual yield percentage
+      // Base Oil is % of UMO VGO, everything else is % of Crude Rate
+      // Feedstocks (Crude Rate, UMO VGO) don't have % yields
+      let actualPct: number | null = null;
+      if (!isFeedstock) {
+        if (isBaseOil && umoVgoDailyAvg > 0) {
+          actualPct = (displayValue / umoVgoDailyAvg) * 100;
+        } else if (crudeRateDailyAvg > 0) {
+          actualPct = (displayValue / crudeRateDailyAvg) * 100;
+        }
+      }
 
       // Get raw target values
-      const rawMonthlyPlanPct = isCrudeRate ? null : target?.monthly_plan_target || null;
-      const rawBusinessPlanPct = isCrudeRate ? null : target?.business_plan_target || null;
+      const rawMonthlyPlanPct = isFeedstock ? null : target?.monthly_plan_target || null;
+      const rawBusinessPlanPct = isFeedstock ? null : target?.business_plan_target || null;
       const rawMonthlyPlanRate = target?.monthly_plan_rate || null;
       const rawBusinessPlanRate = target?.business_plan_rate || null;
 
-      // Auto-calculate missing values based on crude rate targets
+      // Auto-calculate missing values based on appropriate feed rate
       let monthlyPlanPct = rawMonthlyPlanPct;
       let monthlyPlanRate = rawMonthlyPlanRate;
       let businessPlanPct = rawBusinessPlanPct;
       let businessPlanRate = rawBusinessPlanRate;
 
-      if (!isCrudeRate) {
+      if (!isFeedstock) {
+        // Determine which feed rate to use for calculations
+        const basePlanRate = isBaseOil ? umoVgoPlanRate : crudeRatePlanRate;
+        const baseBpRate = isBaseOil ? umoVgoBpRate : crudeRateBpRate;
+
         // Monthly Plan: auto-calculate % from rate or rate from %
-        if (monthlyPlanRate !== null && monthlyPlanPct === null && crudeRatePlanRate) {
-          monthlyPlanPct = (monthlyPlanRate / crudeRatePlanRate) * 100;
-        } else if (monthlyPlanPct !== null && monthlyPlanRate === null && crudeRatePlanRate) {
-          monthlyPlanRate = (monthlyPlanPct / 100) * crudeRatePlanRate;
+        if (monthlyPlanRate !== null && monthlyPlanPct === null && basePlanRate) {
+          monthlyPlanPct = (monthlyPlanRate / basePlanRate) * 100;
+        } else if (monthlyPlanPct !== null && monthlyPlanRate === null && basePlanRate) {
+          monthlyPlanRate = (monthlyPlanPct / 100) * basePlanRate;
         }
 
         // Business Plan: auto-calculate % from rate or rate from %
-        if (businessPlanRate !== null && businessPlanPct === null && crudeRateBpRate) {
-          businessPlanPct = (businessPlanRate / crudeRateBpRate) * 100;
-        } else if (businessPlanPct !== null && businessPlanRate === null && crudeRateBpRate) {
-          businessPlanRate = (businessPlanPct / 100) * crudeRateBpRate;
+        if (businessPlanRate !== null && businessPlanPct === null && baseBpRate) {
+          businessPlanPct = (businessPlanRate / baseBpRate) * 100;
+        } else if (businessPlanPct !== null && businessPlanRate === null && baseBpRate) {
+          businessPlanRate = (businessPlanPct / 100) * baseBpRate;
         }
       }
 
       // Determine variance - prefer percentage target, fallback to rate-based calculation
       let variance: number | null = null;
-      if (isCrudeRate) {
-        // For crude rate, calculate variance as percentage difference from plan
+      if (isFeedstock) {
+        // For feedstocks, calculate variance as percentage difference from plan rate
         if (monthlyPlanRate !== null && monthlyPlanRate > 0) {
           variance = ((displayValue - monthlyPlanRate) / monthlyPlanRate) * 100;
         }
@@ -405,7 +474,8 @@ export default function MonthlyYieldTable() {
         variance = getVariancePct(actualPct, monthlyPlanPct);
         // If no percentage target, calculate from rate targets
         if (variance === null && monthlyPlanRate !== null) {
-          variance = getVarianceRate(displayValue, monthlyPlanRate, crudeRateDailyAvg);
+          const baseRate = isBaseOil ? umoVgoDailyAvg : crudeRateDailyAvg;
+          variance = getVarianceRate(displayValue, monthlyPlanRate, baseRate);
         }
       }
       const status = getStatus(variance, bucket.bucket_name);
@@ -422,9 +492,10 @@ export default function MonthlyYieldTable() {
         status,
         variance,
         is_crude_rate: isCrudeRate,
+        is_feedstock: isFeedstock,
       };
     });
-  }, [mtdData, targetsLookup, crudeRateDailyAvg, crudeRatePlanRate, crudeRateBpRate]);
+  }, [mtdData, targetsLookup, crudeRateDailyAvg, crudeRatePlanRate, crudeRateBpRate, umoVgoDailyAvg, umoVgoPlanRate, umoVgoBpRate]);
 
   // Initialize edit targets when entering edit mode or period changes
   useEffect(() => {
@@ -552,6 +623,97 @@ export default function MonthlyYieldTable() {
       setTimeout(() => setRefreshStatus('idle'), 5000);
     }
   }, [selectedMonth.value, queryClient, isRefreshing]);
+
+  // Handle paste targets save
+  const handlePasteTargetsSave = useCallback(async (data: {
+    monthly: { bucket_name: string; monthly_plan_target: number | null; monthly_plan_rate: number | null }[];
+    periods: { period: number; targets: { bucket_name: string; monthly_plan_target: number | null; monthly_plan_rate: number | null }[] }[];
+  }) => {
+    const res = await fetch('/api/targets/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        month: selectedMonth.value,
+        monthly: data.monthly,
+        periods: data.periods,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error('Failed to save targets');
+    }
+
+    // Invalidate all target-related queries
+    queryClient.invalidateQueries({ queryKey: ['yield-targets'] });
+    queryClient.invalidateQueries({ queryKey: ['period-targets'] });
+    queryClient.invalidateQueries({ queryKey: ['yield-mtd'] });
+  }, [selectedMonth.value, queryClient]);
+
+  // Export table data as CSV
+  const handleExportCSV = useCallback(() => {
+    if (!tableData.length) return;
+
+    const headers = [
+      'Product Bucket',
+      'Plan Rate (BBL)',
+      'Plan %',
+      'BP Rate (BBL)',
+      'BP %',
+      'Daily Avg (BBL)',
+      'Actual %',
+      'Variance %',
+      'Status'
+    ];
+
+    const rows = tableData.map((row: any) => [
+      row.bucket_name,
+      row.monthly_plan_rate !== null ? row.monthly_plan_rate.toFixed(0) : '',
+      row.monthly_plan_pct !== null ? row.monthly_plan_pct.toFixed(2) : '',
+      row.business_plan_rate !== null ? row.business_plan_rate.toFixed(0) : '',
+      row.business_plan_pct !== null ? row.business_plan_pct.toFixed(2) : '',
+      row.mtd_daily_avg.toFixed(0),
+      row.actual_pct !== null ? row.actual_pct.toFixed(2) : '',
+      row.variance !== null ? row.variance.toFixed(2) : '',
+      row.status
+    ]);
+
+    const csvContent = [
+      `Yield Performance - ${selectedMonth.label}${selectedPeriod !== null ? ` (Period ${selectedPeriod})` : ''}`,
+      `Generated: ${new Date().toLocaleString()}`,
+      `Days: ${dayCount}`,
+      '',
+      headers.join(','),
+      ...rows.map((row: (string | number)[]) => row.map((cell) => `"${cell}"`).join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `yield-performance-${selectedMonth.value}${selectedPeriod !== null ? `-p${selectedPeriod}` : ''}.csv`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }, [tableData, selectedMonth, selectedPeriod, dayCount]);
+
+  // Export table as PNG image
+  const handleExportPNG = useCallback(async () => {
+    if (!tableRef.current) return;
+
+    try {
+      const canvas = await html2canvas(tableRef.current, {
+        backgroundColor: '#ffffff',
+        scale: 2, // Higher resolution
+        logging: false,
+        useCORS: true,
+      });
+
+      const link = document.createElement('a');
+      link.download = `yield-performance-${selectedMonth.value}${selectedPeriod !== null ? `-p${selectedPeriod}` : ''}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    } catch (error) {
+      console.error('Failed to export PNG:', error);
+    }
+  }, [selectedMonth, selectedPeriod]);
 
   const isLoading = mtdLoading || targetsLoading;
 
@@ -698,12 +860,43 @@ export default function MonthlyYieldTable() {
                 </button>
               </>
             ) : (
-              <button
-                onClick={() => setIsEditing(true)}
-                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 hover:border-gray-400 transition-colors shadow-sm"
-              >
-                Edit Targets
-              </button>
+              <>
+                {/* Download Buttons */}
+                <div className="flex items-center gap-1 border-r border-gray-200 pr-3 mr-2">
+                  <button
+                    onClick={handleExportCSV}
+                    disabled={!tableData.length}
+                    className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Download as CSV"
+                  >
+                    <Download className="h-4 w-4" />
+                    CSV
+                  </button>
+                  <button
+                    onClick={handleExportPNG}
+                    disabled={!tableData.length}
+                    className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Download as PNG"
+                  >
+                    <Image className="h-4 w-4" />
+                    PNG
+                  </button>
+                </div>
+                <button
+                  onClick={() => setPasteModalOpen(true)}
+                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-violet-700 bg-violet-50 border border-violet-200 rounded-lg hover:bg-violet-100 hover:border-violet-300 transition-colors shadow-sm"
+                  title="Paste targets from Excel"
+                >
+                  <ClipboardPaste className="h-4 w-4" />
+                  Paste Targets
+                </button>
+                <button
+                  onClick={() => setIsEditing(true)}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 hover:border-gray-400 transition-colors shadow-sm"
+                >
+                  Edit Targets
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -733,6 +926,33 @@ export default function MonthlyYieldTable() {
                 </button>
               ))}
             </div>
+            <select
+              value={selectedMonth.value}
+              onChange={(e) => {
+                const found = allMonthOptions.find(m => m.value === e.target.value);
+                if (found) setSelectedMonth(found);
+              }}
+              className="px-3 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-200 rounded-lg shadow-sm cursor-pointer hover:border-gray-300 transition-colors"
+            >
+              <optgroup label="Future">
+                {allMonthOptions.filter(m => {
+                  const now = new Date();
+                  const [y, mo] = m.value.split('-').map(Number);
+                  return y > now.getFullYear() || (y === now.getFullYear() && mo > now.getMonth() + 1);
+                }).map(m => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+              </optgroup>
+              <optgroup label="Current & Past">
+                {allMonthOptions.filter(m => {
+                  const now = new Date();
+                  const [y, mo] = m.value.split('-').map(Number);
+                  return y < now.getFullYear() || (y === now.getFullYear() && mo <= now.getMonth() + 1);
+                }).map(m => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+              </optgroup>
+            </select>
             <button
               onClick={() => setPeriodModalOpen(true)}
               className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-600 hover:text-gray-900 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors shadow-sm"
@@ -785,7 +1005,7 @@ export default function MonthlyYieldTable() {
         </div>
 
         {/* Data Table */}
-        <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xl shadow-gray-200/50">
+        <div ref={tableRef} className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xl shadow-gray-200/50">
           {isLoading ? (
             <div className="h-[500px] flex items-center justify-center">
               <div className="flex flex-col items-center gap-4">
@@ -821,27 +1041,39 @@ export default function MonthlyYieldTable() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {tableData.map((row: any, idx: number) => {
+                  {tableData
+                    .filter((row: any) => row.bucket_name !== 'Commercial LPG')
+                    .map((row: any, idx: number) => {
                     const editRow = editTargets.find(t => t.bucket_name === row.bucket_name);
+                    const isLpgRow = row.bucket_name === 'LPG';
+                    const commercialLpgData = isLpgRow ? tableData.find((r: any) => r.bucket_name === 'Commercial LPG') : null;
+                    const commercialLpgEditRow = commercialLpgData ? editTargets.find(t => t.bucket_name === 'Commercial LPG') : null;
 
                     return (
+                      <Fragment key={row.bucket_name}>
                       <tr
-                        key={row.bucket_name}
                         className={`table-row-hover transition-colors ${
-                          row.is_crude_rate
+                          row.is_feedstock
                             ? 'bg-gradient-to-r from-amber-50 to-transparent border-l-2 border-l-amber-500'
                             : ''
-                        }`}
+                        } ${isLpgRow ? 'cursor-pointer' : ''}`}
                         style={{ animationDelay: `${idx * 50}ms` }}
+                        onClick={isLpgRow ? () => setLpgExpanded(!lpgExpanded) : undefined}
                       >
                         <td className="py-4 px-6">
                           <div className="flex items-center gap-3">
-                            {row.is_crude_rate ? (
+                            {row.is_feedstock ? (
                               <div className="w-2 h-2 rounded-full bg-amber-500 shadow-sm shadow-amber-500/50" />
+                            ) : isLpgRow ? (
+                              <div className={`w-4 h-4 flex items-center justify-center transition-transform ${lpgExpanded ? 'rotate-90' : ''}`}>
+                                <svg className="w-3 h-3 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                </svg>
+                              </div>
                             ) : (
                               <div className="w-2 h-2 rounded-full bg-gray-300" />
                             )}
-                            <span className={`font-medium ${row.is_crude_rate ? 'text-amber-700' : 'text-gray-900'}`}>
+                            <span className={`font-medium ${row.is_feedstock ? 'text-amber-700' : 'text-gray-900'}`}>
                               {row.bucket_name}
                             </span>
                           </div>
@@ -849,7 +1081,7 @@ export default function MonthlyYieldTable() {
                         {/* Plan Column */}
                         <td className="text-right py-3 px-6 font-mono-data">
                           {isEditing ? (
-                            row.is_crude_rate ? (
+                            row.is_feedstock ? (
                               <input
                                 type="number"
                                 step="100"
@@ -884,7 +1116,7 @@ export default function MonthlyYieldTable() {
                                 />
                               </div>
                             )
-                          ) : row.is_crude_rate ? (
+                          ) : row.is_feedstock ? (
                             row.monthly_plan_rate !== null ? (
                               <span className="text-amber-700 text-sm font-medium">
                                 {formatNumber(row.monthly_plan_rate, 0)}
@@ -907,7 +1139,7 @@ export default function MonthlyYieldTable() {
                         </td>
                         <td className="text-right py-3 px-6 font-mono-data">
                           {isEditing ? (
-                            row.is_crude_rate ? (
+                            row.is_feedstock ? (
                               <input
                                 type="number"
                                 step="100"
@@ -948,7 +1180,7 @@ export default function MonthlyYieldTable() {
                                 />
                               </div>
                             )
-                          ) : row.is_crude_rate ? (
+                          ) : row.is_feedstock ? (
                             row.business_plan_rate !== null ? (
                               <span className="text-amber-600 text-sm">
                                 {formatNumber(row.business_plan_rate, 0)}
@@ -972,7 +1204,7 @@ export default function MonthlyYieldTable() {
                         {/* Daily Avg Column */}
                         <td className="text-right py-4 px-6 font-mono-data">
                           <span className={`font-semibold ${
-                            row.is_crude_rate ? (
+                            row.is_feedstock ? (
                               row.status === 'good' ? 'text-emerald-600' :
                               row.status === 'warning' ? 'text-amber-600' :
                               row.status === 'bad' ? 'text-rose-600' : 'text-gray-900'
@@ -1013,6 +1245,144 @@ export default function MonthlyYieldTable() {
                           )}
                         </td>
                       </tr>
+                      {/* Commercial LPG row - appears below LPG when expanded */}
+                      {isLpgRow && lpgExpanded && commercialLpgData && (
+                        <tr
+                          key="Commercial LPG"
+                          className="table-row-hover transition-colors bg-gradient-to-r from-violet-50/50 to-transparent border-l-2 border-l-violet-400"
+                        >
+                          <td className="py-4 px-6 pl-10">
+                            <div className="flex items-center gap-3">
+                              <div className="w-2 h-2 rounded-full bg-violet-400" />
+                              <span className="font-medium text-violet-700">
+                                Commercial LPG
+                              </span>
+                            </div>
+                          </td>
+                          {/* Plan Column */}
+                          <td className="text-right py-3 px-6 font-mono-data">
+                            {isEditing ? (
+                              <div className="flex flex-col gap-1.5 items-end">
+                                <input
+                                  type="number"
+                                  step="100"
+                                  className="yield-input w-20 px-2 py-1 text-right text-xs rounded"
+                                  value={commercialLpgEditRow?.monthly_plan_rate || ''}
+                                  onChange={(e) =>
+                                    handleTargetChange('Commercial LPG', 'monthly_plan_rate', e.target.value)
+                                  }
+                                  placeholder="BBL"
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  className="yield-input w-20 px-2 py-1 text-right text-xs rounded"
+                                  value={commercialLpgEditRow?.monthly_plan_target || ''}
+                                  onChange={(e) =>
+                                    handleTargetChange('Commercial LPG', 'monthly_plan_target', e.target.value)
+                                  }
+                                  placeholder="%"
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              </div>
+                            ) : (commercialLpgData.monthly_plan_rate !== null || commercialLpgData.monthly_plan_pct !== null) ? (
+                              <div className="flex flex-col">
+                                <span className="text-gray-700 text-sm">
+                                  {commercialLpgData.monthly_plan_rate !== null ? formatNumber(commercialLpgData.monthly_plan_rate, 0) : '—'}
+                                </span>
+                                <span className="text-gray-500 text-xs">
+                                  {commercialLpgData.monthly_plan_pct !== null ? `${commercialLpgData.monthly_plan_pct.toFixed(2)}%` : '—'}
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="text-gray-400">—</span>
+                            )}
+                          </td>
+                          {/* BP Column */}
+                          <td className="text-right py-3 px-6 font-mono-data">
+                            {isEditing ? (
+                              <div className="flex flex-col gap-1.5 items-end">
+                                <input
+                                  type="number"
+                                  step="100"
+                                  className={`yield-input w-20 px-2 py-1 text-right text-xs rounded ${selectedPeriod !== null ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
+                                  value={commercialLpgEditRow?.business_plan_rate || ''}
+                                  onChange={(e) =>
+                                    handleTargetChange('Commercial LPG', 'business_plan_rate', e.target.value)
+                                  }
+                                  placeholder="BBL"
+                                  disabled={selectedPeriod !== null}
+                                  title={selectedPeriod !== null ? 'BP values are monthly-only' : ''}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  className={`yield-input w-20 px-2 py-1 text-right text-xs rounded ${selectedPeriod !== null ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
+                                  value={commercialLpgEditRow?.business_plan_target || ''}
+                                  onChange={(e) =>
+                                    handleTargetChange('Commercial LPG', 'business_plan_target', e.target.value)
+                                  }
+                                  placeholder="%"
+                                  disabled={selectedPeriod !== null}
+                                  title={selectedPeriod !== null ? 'BP values are monthly-only' : ''}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              </div>
+                            ) : (commercialLpgData.business_plan_rate !== null || commercialLpgData.business_plan_pct !== null) ? (
+                              <div className="flex flex-col">
+                                <span className="text-gray-600 text-sm">
+                                  {commercialLpgData.business_plan_rate !== null ? formatNumber(commercialLpgData.business_plan_rate, 0) : '—'}
+                                </span>
+                                <span className="text-gray-400 text-xs">
+                                  {commercialLpgData.business_plan_pct !== null ? `${commercialLpgData.business_plan_pct.toFixed(2)}%` : '—'}
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="text-gray-400">—</span>
+                            )}
+                          </td>
+                          {/* Daily Avg Column */}
+                          <td className="text-right py-4 px-6 font-mono-data">
+                            <span className="font-semibold text-gray-900">
+                              {formatNumber(commercialLpgData.mtd_daily_avg, 0)}
+                            </span>
+                          </td>
+                          {/* Actual % Column */}
+                          <td className="text-right py-4 px-6 font-mono-data">
+                            {commercialLpgData.actual_pct !== null ? (
+                              <span className={`font-semibold ${
+                                commercialLpgData.status === 'good' ? 'text-emerald-600' :
+                                commercialLpgData.status === 'warning' ? 'text-amber-600' :
+                                commercialLpgData.status === 'bad' ? 'text-rose-600' : 'text-gray-900'
+                              }`}>
+                                {commercialLpgData.actual_pct.toFixed(2)}%
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">—</span>
+                            )}
+                          </td>
+                          {/* Variance Column */}
+                          <td className="py-4 px-6">
+                            {commercialLpgData.variance !== null ? (
+                              <div className="flex items-center gap-3">
+                                <div className="flex-1">
+                                  <StatusBar status={commercialLpgData.status} variance={commercialLpgData.variance} />
+                                </div>
+                                <span className={`font-mono-data text-xs min-w-[50px] text-right font-semibold ${
+                                  commercialLpgData.variance >= 0 ? 'text-emerald-600' : 'text-rose-600'
+                                }`}>
+                                  {commercialLpgData.variance >= 0 ? '+' : ''}{commercialLpgData.variance.toFixed(2)}%
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="h-2" />
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
                     );
                   })}
                 </tbody>
@@ -1284,6 +1654,16 @@ export default function MonthlyYieldTable() {
           queryClient.invalidateQueries({ queryKey: ['periods', selectedMonth.value] });
           queryClient.invalidateQueries({ queryKey: ['yield-mtd', selectedMonth.value] });
         }}
+      />
+
+      {/* Paste Targets Modal */}
+      <PasteTargetsModal
+        open={pasteModalOpen}
+        onOpenChange={setPasteModalOpen}
+        month={selectedMonth.label}
+        hasPeriods={hasPeriods}
+        periodCount={periods.length}
+        onSave={handlePasteTargetsSave}
       />
     </div>
   );

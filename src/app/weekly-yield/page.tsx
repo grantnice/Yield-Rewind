@@ -4,7 +4,7 @@ import { useState, useMemo, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { TimeSeriesChart, TimeSeriesDataPoint, ReferenceLineConfig, YAxisBounds } from '@/components/charts/time-series-chart';
+import { TimeSeriesChart, TimeSeriesDataPoint, ReferenceLineConfig, YAxisBounds, PeriodBoundary } from '@/components/charts/time-series-chart';
 import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react';
 
 // Chart color palette (matching time-series-chart.tsx)
@@ -42,11 +42,20 @@ interface WeeklyData {
       target_pct: number | null;
       target_rate: number | null;
     }>;
+    targetsByPeriod?: Record<string, {
+      startDate: string;
+      endDate: string;
+      buckets: Record<string, {
+        target_pct: number | null;
+        target_rate: number | null;
+      }>;
+    }>;
   };
   meta: {
     start_date: string;
     end_date: string;
-    month: string;
+    months?: string[]; // New: array of months covered
+    month?: string; // Deprecated: kept for backward compatibility
     query_time_ms: number;
   };
 }
@@ -119,7 +128,11 @@ export default function WeeklyYieldPage() {
     setYAxisBounds({ min: null, max: null });
   }, []);
 
-  // Transform data for chart
+  // Check if Crude Rate is selected (needs special handling - show rate, not %)
+  const hasCrudeRate = selectedBuckets.includes('Crude Rate');
+  const nonCrudeBuckets = selectedBuckets.filter(b => b !== 'Crude Rate');
+
+  // Transform data for chart (Crude Rate uses daily_rate, others use daily_pct)
   const chartData = useMemo((): TimeSeriesDataPoint[] => {
     if (!data?.data?.dates) return [];
 
@@ -128,62 +141,248 @@ export default function WeeklyYieldPage() {
       selectedBuckets.forEach(bucket => {
         const bucketData = data.data.buckets[bucket];
         if (bucketData) {
-          row[bucket] = bucketData.daily_pct[idx];
+          // Crude Rate should show as rate (BBL), not percentage
+          if (bucket === 'Crude Rate') {
+            row[bucket] = bucketData.daily_rate[idx];
+          } else {
+            row[bucket] = bucketData.daily_pct[idx];
+          }
         }
       });
       return row;
     });
   }, [data, selectedBuckets]);
 
-  // Build reference lines for MOP targets
+  // Determine period boundaries for chart display
+  const periodBoundaries = useMemo(() => {
+    if (!data?.data?.targetsByPeriod || !data?.data?.dates) return [];
+
+    const targetsByPeriod = data.data.targetsByPeriod;
+    const periodKeys = Object.keys(targetsByPeriod).sort();
+    const chartDates = data.data.dates;
+
+    if (periodKeys.length <= 1) return [];
+
+    const chartStartDate = chartDates[0];
+    const chartEndDate = chartDates[chartDates.length - 1];
+
+    // Find boundaries between periods (the end date of each period except the last)
+    const boundaries: { date: string; label: string }[] = [];
+    periodKeys.forEach((periodKey, idx) => {
+      if (idx === periodKeys.length - 1) return; // Skip last period
+      const periodData = targetsByPeriod[periodKey];
+      const endDate = periodData.endDate;
+
+      // Only include if boundary is within chart range
+      if (endDate >= chartStartDate && endDate < chartEndDate) {
+        const match = periodKey.match(/^(\d{4})-(\d{2})(?:-P(\d))?$/);
+        const label = match?.[3] ? `P${match[3]}` : '';
+        boundaries.push({ date: endDate, label });
+      }
+    });
+
+    return boundaries;
+  }, [data]);
+
+  // Build reference lines for MOP targets (exclude Crude Rate - different scale)
+  // When multiple periods, don't show reference lines - rely on table instead
   const referenceLines = useMemo((): ReferenceLineConfig[] => {
     if (!data?.data?.buckets) return [];
 
     const lines: ReferenceLineConfig[] = [];
+    const targetsByPeriod = data.data.targetsByPeriod;
+
+    if (!targetsByPeriod || Object.keys(targetsByPeriod).length === 0) {
+      // Fallback to bucket-level targets (full-width lines)
+      selectedBuckets.forEach((bucket, idx) => {
+        if (bucket === 'Crude Rate') return;
+        const bucketData = data.data.buckets[bucket];
+        if (bucketData?.target_pct != null) {
+          const seriesColor = CHART_COLORS[idx % CHART_COLORS.length];
+          lines.push({
+            value: bucketData.target_pct,
+            label: `${bucket} MOP`,
+            color: seriesColor,
+            seriesKey: bucket,
+          });
+        }
+      });
+      return lines;
+    }
+
+    // Get sorted period keys to determine if we need segmented display
+    const periodKeys = Object.keys(targetsByPeriod).sort();
+    const hasMultiplePeriods = periodKeys.length > 1;
+
+    // For multiple periods, don't show reference lines - too cluttered
+    // The summary table shows period-specific comparisons instead
+    if (hasMultiplePeriods) {
+      return [];
+    }
+
+    // Single period - show full-width reference lines
+    const periodKey = periodKeys[0];
+    const periodData = targetsByPeriod[periodKey];
+
     selectedBuckets.forEach((bucket, idx) => {
-      const bucketData = data.data.buckets[bucket];
-      if (bucketData?.target_pct != null) {
+      if (bucket === 'Crude Rate') return;
+
+      const seriesColor = CHART_COLORS[idx % CHART_COLORS.length];
+      const targetPct = periodData?.buckets?.[bucket]?.target_pct;
+
+      if (targetPct != null) {
         lines.push({
-          value: bucketData.target_pct,
+          value: targetPct,
           label: `${bucket} MOP`,
-          color: CHART_COLORS[idx % CHART_COLORS.length],
+          color: seriesColor,
           seriesKey: bucket,
         });
       }
     });
+
     return lines;
   }, [data, selectedBuckets]);
 
-  // Calculate summary statistics
-  const summaryStats = useMemo(() => {
-    if (!data?.data?.buckets) return [];
+  // Calculate summary statistics per period
+  const periodSummaryStats = useMemo(() => {
+    if (!data?.data?.buckets || !data?.data?.dates) return [];
 
-    return selectedBuckets.map((bucket, idx) => {
-      const bucketData = data.data.buckets[bucket];
-      if (!bucketData) return null;
+    const targetsByPeriod = data.data.targetsByPeriod;
+    const chartDates = data.data.dates;
 
-      const validPcts = bucketData.daily_pct.filter((v): v is number => v !== null);
-      if (validPcts.length === 0) return null;
+    if (!targetsByPeriod || Object.keys(targetsByPeriod).length === 0) {
+      // No period data - return single summary using bucket-level targets
+      return [{
+        periodKey: 'all',
+        periodLabel: 'Week',
+        startDate: chartDates[0],
+        endDate: chartDates[chartDates.length - 1],
+        stats: selectedBuckets.map((bucket, idx) => {
+          const bucketData = data.data.buckets[bucket];
+          if (!bucketData) return null;
 
-      const avg = validPcts.reduce((a, b) => a + b, 0) / validPcts.length;
-      const target = bucketData.target_pct;
-      const variance = target != null ? avg - target : null;
+          const isCrude = bucket === 'Crude Rate';
+          const values = isCrude ? bucketData.daily_rate : bucketData.daily_pct;
+          const validValues = values.filter((v): v is number => v !== null);
+          if (validValues.length === 0) return null;
+
+          const avg = validValues.reduce((a, b) => a + b, 0) / validValues.length;
+          const target = isCrude ? bucketData.target_rate : bucketData.target_pct;
+          const variance = target != null ? avg - target : null;
+          const variancePct = isCrude && target != null && target > 0
+            ? ((avg - target) / target) * 100
+            : variance;
+
+          return {
+            bucket,
+            avg,
+            target,
+            variance: variancePct,
+            color: CHART_COLORS[idx % CHART_COLORS.length],
+            isCrude,
+          };
+        }).filter((s): s is NonNullable<typeof s> => s !== null),
+      }];
+    }
+
+    // Get sorted period keys
+    const periodKeys = Object.keys(targetsByPeriod).sort();
+    const chartStartDate = chartDates[0];
+    const chartEndDate = chartDates[chartDates.length - 1];
+
+    // Format period key for label
+    const formatPeriodLabel = (periodKey: string): string => {
+      const match = periodKey.match(/^(\d{4})-(\d{2})(?:-P(\d))?$/);
+      if (!match) return periodKey;
+      const [, year, month, periodNum] = match;
+      const date = new Date(parseInt(year), parseInt(month) - 1, 1);
+      const monthName = date.toLocaleDateString('en-US', { month: 'short' });
+      return periodNum ? `${monthName} P${periodNum}` : monthName;
+    };
+
+    // Build stats for each period
+    return periodKeys.map((periodKey) => {
+      const periodData = targetsByPeriod[periodKey];
+      const periodStart = periodData.startDate;
+      const periodEnd = periodData.endDate;
+
+      // Skip if period is completely outside chart range
+      if (periodEnd < chartStartDate || periodStart > chartEndDate) return null;
+
+      // Clamp period dates to chart range
+      const effectiveStart = periodStart < chartStartDate ? chartStartDate : periodStart;
+      const effectiveEnd = periodEnd > chartEndDate ? chartEndDate : periodEnd;
+
+      // Find indices of dates within this period
+      const periodIndices: number[] = [];
+      chartDates.forEach((date, idx) => {
+        if (date >= effectiveStart && date <= effectiveEnd) {
+          periodIndices.push(idx);
+        }
+      });
+
+      if (periodIndices.length === 0) return null;
+
+      const stats = selectedBuckets.map((bucket, idx) => {
+        const bucketData = data.data.buckets[bucket];
+        if (!bucketData) return null;
+
+        const isCrude = bucket === 'Crude Rate';
+        const allValues = isCrude ? bucketData.daily_rate : bucketData.daily_pct;
+
+        // Get values only for this period
+        const periodValues = periodIndices
+          .map(i => allValues[i])
+          .filter((v): v is number => v !== null);
+
+        if (periodValues.length === 0) return null;
+
+        const avg = periodValues.reduce((a, b) => a + b, 0) / periodValues.length;
+        const target = isCrude
+          ? periodData.buckets[bucket]?.target_rate
+          : periodData.buckets[bucket]?.target_pct;
+        const variance = target != null ? avg - target : null;
+        const variancePct = isCrude && target != null && target > 0
+          ? ((avg - target) / target) * 100
+          : variance;
+
+        return {
+          bucket,
+          avg,
+          target,
+          variance: variancePct,
+          color: CHART_COLORS[idx % CHART_COLORS.length],
+          isCrude,
+          daysInPeriod: periodValues.length,
+        };
+      }).filter((s): s is NonNullable<typeof s> => s !== null);
 
       return {
-        bucket,
-        avg,
-        target,
-        variance,
-        color: CHART_COLORS[idx % CHART_COLORS.length],
+        periodKey,
+        periodLabel: formatPeriodLabel(periodKey),
+        startDate: effectiveStart,
+        endDate: effectiveEnd,
+        stats,
       };
     }).filter(Boolean) as Array<{
-      bucket: string;
-      avg: number;
-      target: number | null;
-      variance: number | null;
-      color: string;
+      periodKey: string;
+      periodLabel: string;
+      startDate: string;
+      endDate: string;
+      stats: Array<{
+        bucket: string;
+        avg: number;
+        target: number | null;
+        variance: number | null;
+        color: string;
+        isCrude: boolean;
+        daysInPeriod?: number;
+      }>;
     }>;
   }, [data, selectedBuckets]);
+
+  // Check if we have multiple periods for display logic
+  const hasMultiplePeriods = periodSummaryStats.length > 1;
 
   return (
     <div className="space-y-6">
@@ -261,7 +460,7 @@ export default function WeeklyYieldPage() {
               <p className="text-sm text-gray-500 mt-2">
                 Showing: <strong>{formatDateRange(data.meta.start_date, data.meta.end_date)}</strong>
                 <span className="mx-2">|</span>
-                MOP targets from: <strong>{data.meta.month}</strong>
+                MOP targets from: <strong>{data.meta.months?.join(', ') || data.meta.month}</strong>
               </p>
             )}
           </div>
@@ -307,7 +506,9 @@ export default function WeeklyYieldPage() {
             <div>
               <CardTitle>Daily Yield % vs MOP Target</CardTitle>
               <p className="text-xs text-gray-500 mt-1">
-                Dashed lines show MOP (Monthly Plan) targets for each bucket
+                {periodBoundaries.length > 0
+                  ? 'Vertical dashed lines mark period boundaries. See table below for MOP targets per period.'
+                  : 'Dashed lines show MOP (Monthly Plan) targets for each bucket'}
                 {(yAxisBounds.min !== null || yAxisBounds.max !== null) && (
                   <span className="ml-2 px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded">
                     Y: {yAxisBounds.min ?? 'auto'} - {yAxisBounds.max ?? 'auto'}
@@ -337,6 +538,9 @@ export default function WeeklyYieldPage() {
               yAxisBounds={yAxisBounds}
               onYAxisBoundsChange={setYAxisBounds}
               referenceLines={referenceLines}
+              secondaryAxisKeys={hasCrudeRate ? ['Crude Rate'] : []}
+              secondaryAxisLabel={hasCrudeRate ? 'Crude Rate (BBL)' : undefined}
+              periodBoundaries={periodBoundaries}
             />
           ) : (
             <div className="h-[400px] flex items-center justify-center bg-gray-50 rounded-lg">
@@ -347,77 +551,102 @@ export default function WeeklyYieldPage() {
       </Card>
 
       {/* Summary Table */}
-      {summaryStats.length > 0 && (
+      {periodSummaryStats.length > 0 && (
         <Card>
           <CardHeader>
             <CardTitle>Weekly Summary vs MOP</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b">
-                    <th className="text-left py-2 px-3 font-semibold">Bucket</th>
-                    <th className="text-right py-2 px-3 font-semibold">Weekly Avg %</th>
-                    <th className="text-right py-2 px-3 font-semibold">MOP Target %</th>
-                    <th className="text-right py-2 px-3 font-semibold">Variance</th>
-                    <th className="text-center py-2 px-3 font-semibold">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {summaryStats.map((stat) => {
-                    const isLoss = stat.bucket === 'Loss';
-                    const isGood = stat.variance != null
-                      ? (isLoss ? stat.variance <= 0 : stat.variance >= 0)
-                      : null;
-                    const isWarning = stat.variance != null && Math.abs(stat.variance) < 1;
+            <div className="space-y-6">
+              {periodSummaryStats.map((period, periodIdx) => (
+                <div key={period.periodKey}>
+                  {/* Period Header - only show if multiple periods */}
+                  {hasMultiplePeriods && (
+                    <div className="flex items-center gap-2 mb-3 pb-2 border-b-2 border-gray-200">
+                      <span className="font-semibold text-gray-700">{period.periodLabel}</span>
+                      <span className="text-xs text-gray-500">
+                        ({period.startDate} to {period.endDate})
+                      </span>
+                    </div>
+                  )}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b">
+                          <th className="text-left py-2 px-3 font-semibold">Bucket</th>
+                          <th className="text-right py-2 px-3 font-semibold">
+                            {hasMultiplePeriods ? 'Period Avg' : 'Weekly Avg'}
+                          </th>
+                          <th className="text-right py-2 px-3 font-semibold">MOP Target</th>
+                          <th className="text-right py-2 px-3 font-semibold">Variance</th>
+                          <th className="text-center py-2 px-3 font-semibold">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {period.stats.map((stat) => {
+                          const isLoss = stat.bucket === 'Loss';
+                          const isGood = stat.variance != null
+                            ? (isLoss ? stat.variance <= 0 : stat.variance >= 0)
+                            : null;
+                          const isWarning = stat.variance != null && Math.abs(stat.variance) < 1;
 
-                    return (
-                      <tr key={stat.bucket} className="border-b hover:bg-gray-50">
-                        <td className="py-2 px-3">
-                          <span className="flex items-center gap-2">
-                            <span
-                              className="w-3 h-3 rounded-full"
-                              style={{ backgroundColor: stat.color }}
-                            />
-                            <span className="font-medium">{stat.bucket}</span>
-                          </span>
-                        </td>
-                        <td className="text-right py-2 px-3">{stat.avg.toFixed(2)}%</td>
-                        <td className="text-right py-2 px-3">
-                          {stat.target != null ? `${stat.target.toFixed(2)}%` : '-'}
-                        </td>
-                        <td className="text-right py-2 px-3">
-                          {stat.variance != null ? (
-                            <span className={
-                              isGood
-                                ? 'text-green-600'
-                                : isWarning
-                                  ? 'text-yellow-600'
-                                  : 'text-red-600'
-                            }>
-                              {stat.variance >= 0 ? '+' : ''}{stat.variance.toFixed(2)} pp
-                            </span>
-                          ) : '-'}
-                        </td>
-                        <td className="text-center py-2 px-3">
-                          {stat.variance != null && (
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                              isGood
-                                ? 'bg-green-100 text-green-800'
-                                : isWarning
-                                  ? 'bg-yellow-100 text-yellow-800'
-                                  : 'bg-red-100 text-red-800'
-                            }`}>
-                              {isGood ? 'Good' : isWarning ? 'Warning' : 'Below'}
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                          return (
+                            <tr key={stat.bucket} className="border-b hover:bg-gray-50">
+                              <td className="py-2 px-3">
+                                <span className="flex items-center gap-2">
+                                  <span
+                                    className="w-3 h-3 rounded-full"
+                                    style={{ backgroundColor: stat.color }}
+                                  />
+                                  <span className="font-medium">{stat.bucket}</span>
+                                </span>
+                              </td>
+                              <td className="text-right py-2 px-3">
+                                {stat.isCrude
+                                  ? stat.avg.toLocaleString('en-US', { maximumFractionDigits: 0 })
+                                  : `${stat.avg.toFixed(2)}%`}
+                              </td>
+                              <td className="text-right py-2 px-3">
+                                {stat.target != null
+                                  ? stat.isCrude
+                                    ? stat.target.toLocaleString('en-US', { maximumFractionDigits: 0 })
+                                    : `${stat.target.toFixed(2)}%`
+                                  : '-'}
+                              </td>
+                              <td className="text-right py-2 px-3">
+                                {stat.variance != null ? (
+                                  <span className={
+                                    isGood
+                                      ? 'text-green-600'
+                                      : isWarning
+                                        ? 'text-yellow-600'
+                                        : 'text-red-600'
+                                  }>
+                                    {stat.variance >= 0 ? '+' : ''}{stat.variance.toFixed(2)} pp
+                                  </span>
+                                ) : '-'}
+                              </td>
+                              <td className="text-center py-2 px-3">
+                                {stat.variance != null && (
+                                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                    isGood
+                                      ? 'bg-green-100 text-green-800'
+                                      : isWarning
+                                        ? 'bg-yellow-100 text-yellow-800'
+                                        : 'bg-red-100 text-red-800'
+                                  }`}>
+                                    {isGood ? 'Good' : isWarning ? 'Warning' : 'Below'}
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ))}
             </div>
           </CardContent>
         </Card>

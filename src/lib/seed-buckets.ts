@@ -88,6 +88,13 @@ const YIELD_BUCKETS = [
     is_virtual: true,
     display_order: 10,
   },
+  {
+    bucket_type: 'yield' as const,
+    bucket_name: 'Commercial LPG',
+    component_products: ['COMLPG', 'COMM PROPANE'],
+    is_virtual: false,
+    display_order: 11,
+  },
   // Hidden buckets for internal calculations
   {
     bucket_type: 'yield' as const,

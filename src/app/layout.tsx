@@ -10,6 +10,9 @@ const inter = Inter({ subsets: ['latin'] });
 export const metadata: Metadata = {
   title: 'Yield Rewind - Refinery Analytics Dashboard',
   description: 'High-performance operational yield, sales, and tank inventory reporting',
+  icons: {
+    icon: '/favicon.jpg',
+  },
 };
 
 export default function RootLayout({

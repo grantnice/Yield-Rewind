@@ -36,6 +36,7 @@
     "clsx": "^2.0.0",
     "date-fns": "^3.0.0",
     "echarts": "^5.5.0",
+    "html2canvas": "^1.4.1",
     "idb-keyval": "^6.2.0",
     "lucide-react": "^0.400.0",
     "next": "^15.0.0",
