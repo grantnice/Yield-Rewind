@@ -311,11 +311,56 @@ const initSchema = () => {
 
     CREATE INDEX IF NOT EXISTS idx_sales_history_date ON sales_data_history(date);
     CREATE INDEX IF NOT EXISTS idx_sales_history_sync ON sales_data_history(sync_id);
+
+    -- PI Tag Configuration Table (saved tag configs for historian trending)
+    CREATE TABLE IF NOT EXISTS pi_tag_config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tag_name TEXT NOT NULL,
+      web_id TEXT NOT NULL,
+      display_name TEXT,
+      tag_group TEXT DEFAULT 'default',
+      retrieval_mode TEXT NOT NULL DEFAULT 'summary',
+      interval TEXT DEFAULT '1d',
+      summary_type TEXT DEFAULT 'Average',
+      unit TEXT,
+      y_axis TEXT DEFAULT 'left',
+      color TEXT,
+      display_order INTEGER DEFAULT 0,
+      is_active INTEGER DEFAULT 1,
+      decimals INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(tag_name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pi_tag_group ON pi_tag_config(tag_group);
+    CREATE INDEX IF NOT EXISTS idx_pi_tag_active ON pi_tag_config(is_active);
+
+    -- PI Data Cache: stores fetched PI values to avoid re-querying
+    CREATE TABLE IF NOT EXISTS pi_data_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tag_name TEXT NOT NULL,
+      date TEXT NOT NULL,
+      value REAL NOT NULL,
+      good INTEGER DEFAULT 1,
+      retrieval_mode TEXT NOT NULL,
+      cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(tag_name, date, retrieval_mode)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pi_cache_tag_date ON pi_data_cache(tag_name, date);
+    CREATE INDEX IF NOT EXISTS idx_pi_cache_date ON pi_data_cache(date);
   `);
 };
 
 // Initialize on first import
 initSchema();
+
+// Migration: Add decimals column to pi_tag_config
+try {
+  db.exec(`ALTER TABLE pi_tag_config ADD COLUMN decimals INTEGER`);
+} catch {
+  // Column already exists
+}
 
 export { db };
 export default db;

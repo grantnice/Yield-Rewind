@@ -384,3 +384,198 @@ export function getSalesStatistics(
   const stmt = db.prepare(query);
   return stmt.all(...params) as ProductStats[];
 }
+
+// ============================================
+// PI TAG CONFIG QUERIES
+// ============================================
+
+export interface PITagConfig {
+  id: number;
+  tag_name: string;
+  web_id: string;
+  display_name: string | null;
+  tag_group: string;
+  retrieval_mode: 'recorded' | 'interpolated' | 'summary';
+  interval: string;
+  summary_type: string;
+  unit: string | null;
+  y_axis: 'left' | 'right';
+  color: string | null;
+  display_order: number;
+  is_active: number;
+  decimals: number | null;
+}
+
+export function getPITagConfigs(group?: string): PITagConfig[] {
+  let query = `
+    SELECT id, tag_name, web_id, display_name, tag_group, retrieval_mode,
+           interval, summary_type, unit, y_axis, color, display_order, is_active, decimals
+    FROM pi_tag_config
+    WHERE is_active = 1
+  `;
+  const params: string[] = [];
+
+  if (group) {
+    query += ' AND tag_group = ?';
+    params.push(group);
+  }
+
+  query += ' ORDER BY display_order ASC, tag_name ASC';
+
+  const stmt = db.prepare(query);
+  return stmt.all(...params) as PITagConfig[];
+}
+
+export function savePITagConfig(config: Omit<PITagConfig, 'id'>): PITagConfig {
+  const stmt = db.prepare(`
+    INSERT INTO pi_tag_config (tag_name, web_id, display_name, tag_group, retrieval_mode,
+                               interval, summary_type, unit, y_axis, color, display_order, is_active, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(tag_name) DO UPDATE SET
+      web_id = excluded.web_id,
+      display_name = excluded.display_name,
+      tag_group = excluded.tag_group,
+      retrieval_mode = excluded.retrieval_mode,
+      interval = excluded.interval,
+      summary_type = excluded.summary_type,
+      unit = excluded.unit,
+      y_axis = excluded.y_axis,
+      color = excluded.color,
+      display_order = excluded.display_order,
+      is_active = excluded.is_active,
+      updated_at = CURRENT_TIMESTAMP
+  `);
+  const result = stmt.run(
+    config.tag_name,
+    config.web_id,
+    config.display_name || null,
+    config.tag_group || 'default',
+    config.retrieval_mode || 'summary',
+    config.interval || '1d',
+    config.summary_type || 'Average',
+    config.unit || null,
+    config.y_axis || 'left',
+    config.color || null,
+    config.display_order || 0,
+    config.is_active ?? 1,
+  );
+
+  const saved = db.prepare('SELECT * FROM pi_tag_config WHERE rowid = ?').get(
+    result.lastInsertRowid
+  ) as PITagConfig;
+  return saved;
+}
+
+export function updatePITagConfig(id: number, updates: Partial<PITagConfig>): void {
+  const fields: string[] = [];
+  const params: (string | number | null)[] = [];
+
+  const allowedFields = [
+    'display_name', 'tag_group', 'retrieval_mode', 'interval',
+    'summary_type', 'unit', 'y_axis', 'color', 'display_order', 'is_active', 'decimals',
+  ];
+
+  for (const field of allowedFields) {
+    if (field in updates) {
+      fields.push(`${field} = ?`);
+      params.push((updates as any)[field] ?? null);
+    }
+  }
+
+  if (fields.length === 0) return;
+
+  fields.push('updated_at = CURRENT_TIMESTAMP');
+  params.push(id);
+
+  const stmt = db.prepare(`UPDATE pi_tag_config SET ${fields.join(', ')} WHERE id = ?`);
+  stmt.run(...params);
+}
+
+export function deletePITagConfig(id: number): void {
+  const stmt = db.prepare('DELETE FROM pi_tag_config WHERE id = ?');
+  stmt.run(id);
+}
+
+// ─── PI Data Cache ────────────────────────────────────────
+
+// ~20MB limit: each row ≈ 50 bytes in SQLite → 400K rows ≈ 20MB
+export const PI_CACHE_MAX_ROWS = 400_000;
+
+export interface PIDataCacheRow {
+  tag_name: string;
+  date: string;
+  value: number;
+  good: number;
+  retrieval_mode: string;
+}
+
+/** Get cached PI data for given tags and date range. */
+export function getPICachedData(
+  tagNames: string[],
+  startDate: string,
+  endDate: string,
+  retrievalMode: string,
+): PIDataCacheRow[] {
+  if (tagNames.length === 0) return [];
+  const placeholders = tagNames.map(() => '?').join(',');
+  const stmt = db.prepare(`
+    SELECT tag_name, date, value, good, retrieval_mode
+    FROM pi_data_cache
+    WHERE tag_name IN (${placeholders})
+      AND date >= ? AND date <= ?
+      AND retrieval_mode = ?
+    ORDER BY tag_name, date
+  `);
+  return stmt.all(...tagNames, startDate, endDate, retrievalMode) as PIDataCacheRow[];
+}
+
+/** Insert PI data into cache. Skips insert if cache is at capacity. Returns number of rows inserted. */
+export function insertPICacheData(rows: PIDataCacheRow[]): number {
+  if (rows.length === 0) return 0;
+
+  // Check current cache size
+  const countStmt = db.prepare('SELECT COUNT(*) as cnt FROM pi_data_cache');
+  const { cnt } = countStmt.get() as { cnt: number };
+
+  const remaining = PI_CACHE_MAX_ROWS - cnt;
+  if (remaining <= 0) return 0; // Cache full — skip silently
+
+  // Only insert up to remaining capacity
+  const toInsert = rows.slice(0, remaining);
+
+  const insertStmt = db.prepare(`
+    INSERT OR REPLACE INTO pi_data_cache (tag_name, date, value, good, retrieval_mode)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const insertMany = db.transaction((items: PIDataCacheRow[]) => {
+    for (const row of items) {
+      insertStmt.run(row.tag_name, row.date, row.value, row.good, row.retrieval_mode);
+    }
+  });
+
+  insertMany(toInsert);
+  return toInsert.length;
+}
+
+/** Get cache statistics. */
+export function getPICacheStats(): { rowCount: number; maxRows: number; tagCount: number; oldestDate: string | null; newestDate: string | null } {
+  const stats = db.prepare(`
+    SELECT COUNT(*) as rowCount,
+           COUNT(DISTINCT tag_name) as tagCount,
+           MIN(date) as oldestDate,
+           MAX(date) as newestDate
+    FROM pi_data_cache
+  `).get() as { rowCount: number; tagCount: number; oldestDate: string | null; newestDate: string | null };
+  return { ...stats, maxRows: PI_CACHE_MAX_ROWS };
+}
+
+/** Clear all cached PI data. */
+export function clearPICache(): void {
+  db.exec('DELETE FROM pi_data_cache');
+}
+
+/** Clear cached data for a specific tag. */
+export function clearPICacheForTag(tagName: string): void {
+  db.prepare('DELETE FROM pi_data_cache WHERE tag_name = ?').run(tagName);
+}

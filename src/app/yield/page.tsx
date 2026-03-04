@@ -7,7 +7,8 @@ import { Button } from '@/components/ui/button';
 import { TimeSeriesChart, TimeSeriesChartRef, YAxisBounds } from '@/components/charts/time-series-chart';
 import { SPCChart, YAxisBounds as SPCYAxisBounds } from '@/components/charts/spc-chart';
 import { SPCControls, BaselineMode, MetricOption } from '@/components/charts/spc-controls';
-import { getDaysAgo, getYesterday, getMonthStart, formatNumber } from '@/lib/utils';
+import { getDaysAgo, getYesterday, getMonthStart, formatNumber, calculatePriorPeriods, getPositionLabel, classifyRange } from '@/lib/utils';
+import type { PriorPeriodRange } from '@/lib/utils';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 
 // Quick date range options
@@ -65,6 +66,103 @@ interface YieldDataRow {
   yield_qty: number | null;
 }
 
+/**
+ * Aggregate raw yield data rows into bucket-level chart rows.
+ * Extracted so it can be reused for both current and prior period data.
+ */
+function aggregateYieldData(
+  rows: YieldDataRow[],
+  items: string[],
+  bucketMap: Record<string, string[]>,
+  metric: string
+): { date: string; [key: string]: number | string }[] {
+  const byDate: Record<string, Record<string, Record<string, number>>> = {};
+  const byDateClass: Record<string, Record<string, Record<string, number>>> = {};
+
+  rows.forEach((row) => {
+    if (!byDate[row.date]) {
+      byDate[row.date] = {};
+      byDateClass[row.date] = {
+        F: { yield_qty: 0, oi_qty: 0, ci_qty: 0, blend_qty: 0, ship_qty: 0, rec_qty: 0 },
+        P: { yield_qty: 0, oi_qty: 0, ci_qty: 0, blend_qty: 0, ship_qty: 0, rec_qty: 0 },
+      };
+    }
+
+    byDate[row.date][row.product_name] = {
+      yield_qty: row.yield_qty || 0,
+      oi_qty: row.oi_qty || 0,
+      ci_qty: row.ci_qty || 0,
+      blend_qty: row.blend_qty || 0,
+      ship_qty: row.ship_qty || 0,
+      rec_qty: row.rec_qty || 0,
+    };
+
+    const classCode = row.product_class as 'F' | 'P';
+    if (classCode && byDateClass[row.date][classCode]) {
+      byDateClass[row.date][classCode].yield_qty += row.yield_qty || 0;
+      byDateClass[row.date][classCode].oi_qty += row.oi_qty || 0;
+      byDateClass[row.date][classCode].ci_qty += row.ci_qty || 0;
+      byDateClass[row.date][classCode].blend_qty += row.blend_qty || 0;
+      byDateClass[row.date][classCode].ship_qty += row.ship_qty || 0;
+      byDateClass[row.date][classCode].rec_qty += row.rec_qty || 0;
+    }
+  });
+
+  const result: any[] = [];
+  Object.entries(byDate).forEach(([date, products]) => {
+    const row: any = { date };
+    const classData = byDateClass[date];
+    const crudeRate = -(classData.F?.yield_qty || 0);
+
+    items.forEach(item => {
+      const bucketDef = bucketMap[item];
+      let value = 0;
+
+      if (!bucketDef) {
+        const productData = products[item];
+        if (productData) {
+          if (metric === 'yield_pct') {
+            value = crudeRate !== 0 ? (productData.yield_qty / crudeRate) * 100 : 0;
+          } else {
+            value = productData[metric] || 0;
+          }
+        }
+      } else if (bucketDef[0]?.startsWith('__CLASS:')) {
+        const classCode = bucketDef[0].replace('__CLASS:', '') as 'F' | 'P';
+        if (metric === 'yield_pct') {
+          if (classCode === 'F') {
+            value = 100;
+          } else {
+            value = crudeRate !== 0 ? (classData[classCode]?.yield_qty || 0) / crudeRate * 100 : 0;
+          }
+        } else {
+          const rawValue = classData[classCode]?.[metric] || 0;
+          value = classCode === 'F' ? -rawValue : rawValue;
+        }
+      } else if (bucketDef[0]?.startsWith('__CALC:')) {
+        if (metric === 'yield_pct') {
+          const nonCrudePct = crudeRate !== 0 ? (classData.P?.yield_qty || 0) / crudeRate * 100 : 0;
+          value = 100 - nonCrudePct;
+        } else {
+          value = -(classData.F?.[metric] || 0) - (classData.P?.[metric] || 0);
+        }
+      } else {
+        if (metric === 'yield_pct') {
+          const bucketYield = bucketDef.reduce((sum, prod) => sum + (products[prod]?.yield_qty || 0), 0);
+          value = crudeRate !== 0 ? (bucketYield / crudeRate) * 100 : 0;
+        } else {
+          value = bucketDef.reduce((sum, prod) => sum + (products[prod]?.[metric] || 0), 0);
+        }
+      }
+
+      row[item] = value;
+    });
+    result.push(row);
+  });
+
+  return result.sort((a, b) => a.date.localeCompare(b.date));
+}
+
 export default function YieldReport() {
   const [selectedRange, setSelectedRange] = useState(dateRanges[2]); // 90 days default
   const [selectedItems, setSelectedItems] = useState<string[]>(defaultSelections);
@@ -76,6 +174,9 @@ export default function YieldReport() {
 
   // Y-axis bounds state
   const [yAxisBounds, setYAxisBounds] = useState<YAxisBounds>({ min: null, max: null });
+
+  // Prior period overlay state (0 = off, 1-3 = number of prior periods)
+  const [priorPeriods, setPriorPeriods] = useState(0);
 
   // SPC state
   const [showSPC, setShowSPC] = useState(false);
@@ -211,112 +312,71 @@ export default function YieldReport() {
     return map;
   }, [buckets]);
 
-  // Transform data for chart (with bucket aggregation including class-based)
+  // Classify the current range for prior period alignment
+  const rangeType = useMemo(() => classifyRange(selectedRange), [selectedRange]);
+
+  // Calculate prior period date ranges
+  const priorPeriodRanges = useMemo((): PriorPeriodRange[] => {
+    if (priorPeriods <= 0) return [];
+    return calculatePriorPeriods(displayDateRange.start, displayDateRange.end, rangeType, priorPeriods);
+  }, [priorPeriods, displayDateRange, rangeType]);
+
+  // Fetch prior period data (up to 3 separate queries, conditionally enabled)
+  const { data: prior1Data } = useQuery({
+    queryKey: ['yield-prior', priorPeriodRanges[0]?.start, priorPeriodRanges[0]?.end],
+    queryFn: async () => {
+      const range = priorPeriodRanges[0];
+      const res = await fetch(`/api/yield?start_date=${range.start}&end_date=${range.end}`);
+      if (!res.ok) throw new Error('Failed to fetch prior period 1');
+      return res.json();
+    },
+    enabled: priorPeriods >= 1 && priorPeriodRanges.length >= 1,
+  });
+
+  const { data: prior2Data } = useQuery({
+    queryKey: ['yield-prior', priorPeriodRanges[1]?.start, priorPeriodRanges[1]?.end],
+    queryFn: async () => {
+      const range = priorPeriodRanges[1];
+      const res = await fetch(`/api/yield?start_date=${range.start}&end_date=${range.end}`);
+      if (!res.ok) throw new Error('Failed to fetch prior period 2');
+      return res.json();
+    },
+    enabled: priorPeriods >= 2 && priorPeriodRanges.length >= 2,
+  });
+
+  const { data: prior3Data } = useQuery({
+    queryKey: ['yield-prior', priorPeriodRanges[2]?.start, priorPeriodRanges[2]?.end],
+    queryFn: async () => {
+      const range = priorPeriodRanges[2];
+      const res = await fetch(`/api/yield?start_date=${range.start}&end_date=${range.end}`);
+      if (!res.ok) throw new Error('Failed to fetch prior period 3');
+      return res.json();
+    },
+    enabled: priorPeriods >= 3 && priorPeriodRanges.length >= 3,
+  });
+
+  // Transform data for chart (using extracted aggregation function)
   const rawChartData = useMemo(() => {
     if (!data?.data) return [];
-
-    // Group by date, storing all metrics per product
-    const byDate: Record<string, Record<string, Record<string, number>>> = {};
-    const byDateClass: Record<string, Record<string, Record<string, number>>> = {};
-
-    data.data.forEach((row: YieldDataRow) => {
-      if (!byDate[row.date]) {
-        byDate[row.date] = {};
-        byDateClass[row.date] = {
-          F: { yield_qty: 0, oi_qty: 0, ci_qty: 0, blend_qty: 0, ship_qty: 0, rec_qty: 0 },
-          P: { yield_qty: 0, oi_qty: 0, ci_qty: 0, blend_qty: 0, ship_qty: 0, rec_qty: 0 },
-        };
-      }
-
-      // Store all metrics for this product
-      byDate[row.date][row.product_name] = {
-        yield_qty: row.yield_qty || 0,
-        oi_qty: row.oi_qty || 0,
-        ci_qty: row.ci_qty || 0,
-        blend_qty: row.blend_qty || 0,
-        ship_qty: row.ship_qty || 0,
-        rec_qty: row.rec_qty || 0,
-      };
-
-      // Aggregate by class for all metrics
-      const classCode = row.product_class as 'F' | 'P';
-      if (classCode && byDateClass[row.date][classCode]) {
-        byDateClass[row.date][classCode].yield_qty += row.yield_qty || 0;
-        byDateClass[row.date][classCode].oi_qty += row.oi_qty || 0;
-        byDateClass[row.date][classCode].ci_qty += row.ci_qty || 0;
-        byDateClass[row.date][classCode].blend_qty += row.blend_qty || 0;
-        byDateClass[row.date][classCode].ship_qty += row.ship_qty || 0;
-        byDateClass[row.date][classCode].rec_qty += row.rec_qty || 0;
-      }
-    });
-
-    // Now aggregate based on selected items and metric
-    const result: any[] = [];
-    Object.entries(byDate).forEach(([date, products]) => {
-      const row: any = { date };
-      const classData = byDateClass[date];
-
-      // Calculate crude rate for yield_pct denominator (always use yield_qty for crude rate)
-      const crudeRate = -(classData.F?.yield_qty || 0); // Negated to be positive
-
-      selectedItems.forEach(item => {
-        const bucketDef = bucketMap[item];
-        let value = 0;
-
-        if (!bucketDef) {
-          // Individual product
-          const productData = products[item];
-          if (productData) {
-            if (selectedMetric === 'yield_pct') {
-              // Yield percent = (product yield / crude rate) * 100
-              value = crudeRate !== 0 ? (productData.yield_qty / crudeRate) * 100 : 0;
-            } else {
-              value = productData[selectedMetric] || 0;
-            }
-          }
-        } else if (bucketDef[0]?.startsWith('__CLASS:')) {
-          // Class-based aggregation (Crude Rate or Non-Crude Total)
-          const classCode = bucketDef[0].replace('__CLASS:', '') as 'F' | 'P';
-          if (selectedMetric === 'yield_pct') {
-            // For Crude Rate yield%, it's always 100%; for Non-Crude, it's sum of P yields / crude rate
-            if (classCode === 'F') {
-              value = 100; // Crude Rate is always 100% of itself
-            } else {
-              value = crudeRate !== 0 ? (classData[classCode]?.yield_qty || 0) / crudeRate * 100 : 0;
-            }
-          } else {
-            const rawValue = classData[classCode]?.[selectedMetric] || 0;
-            // Negate Crude Rate (F) so it displays as positive (feed consumption/inventory)
-            value = classCode === 'F' ? -rawValue : rawValue;
-          }
-        } else if (bucketDef[0]?.startsWith('__CALC:')) {
-          // Calculated field - Loss = Crude Rate - Non-Crude Total
-          if (selectedMetric === 'yield_pct') {
-            // Loss % = 100% - Non-Crude %
-            const nonCrudePct = crudeRate !== 0 ? (classData.P?.yield_qty || 0) / crudeRate * 100 : 0;
-            value = 100 - nonCrudePct;
-          } else {
-            // Loss = (-F) - P for the selected metric
-            value = -(classData.F?.[selectedMetric] || 0) - (classData.P?.[selectedMetric] || 0);
-          }
-        } else {
-          // Regular bucket - sum component products
-          if (selectedMetric === 'yield_pct') {
-            // Sum yield_qty of components, then calculate percentage
-            const bucketYield = bucketDef.reduce((sum, prod) => sum + (products[prod]?.yield_qty || 0), 0);
-            value = crudeRate !== 0 ? (bucketYield / crudeRate) * 100 : 0;
-          } else {
-            value = bucketDef.reduce((sum, prod) => sum + (products[prod]?.[selectedMetric] || 0), 0);
-          }
-        }
-
-        row[item] = value;
-      });
-      result.push(row);
-    });
-
-    return result.sort((a, b) => a.date.localeCompare(b.date));
+    return aggregateYieldData(data.data, selectedItems, bucketMap, selectedMetric);
   }, [data, selectedItems, bucketMap, selectedMetric]);
+
+  // Aggregate prior period data
+  const priorChartDataSets = useMemo(() => {
+    const sets: { data: any[]; label: string }[] = [];
+    const priorDataSources = [prior1Data, prior2Data, prior3Data];
+
+    for (let i = 0; i < priorPeriods; i++) {
+      const pData = priorDataSources[i];
+      if (pData?.data) {
+        sets.push({
+          data: aggregateYieldData(pData.data, selectedItems, bucketMap, selectedMetric),
+          label: priorPeriodRanges[i]?.label || `Prior ${i + 1}`,
+        });
+      }
+    }
+    return sets;
+  }, [prior1Data, prior2Data, prior3Data, priorPeriods, selectedItems, bucketMap, selectedMetric, priorPeriodRanges]);
 
   // Detect complete months (months where we have data from day 1)
   const completeMonths = useMemo(() => {
@@ -349,7 +409,7 @@ export default function YieldReport() {
 
     selectedItems.forEach(item => {
       result[item] = {};
-      const values = rawChartData.map(r => r[item] || 0);
+      const values = rawChartData.map(r => (typeof r[item] === 'number' ? r[item] : 0) as number);
 
       // Calculate rolling averages using sliding window (O(n) each)
       selectedRollingAvgs.forEach(raKey => {
@@ -405,49 +465,106 @@ export default function YieldReport() {
   }, [rawChartData, selectedItems, selectedRollingAvgs, completeMonths]);
 
   // Apply rolling averages and create final chart data (now O(n) lookup)
+  // When prior periods are active, align by position and merge
   const finalChartData = useMemo(() => {
     if (!rawChartData.length) return [];
 
-    // Filter to display date range
     const displayStartDate = displayDateRange.start;
+    const hasPrior = priorPeriods > 0 && priorChartDataSets.length > 0;
 
-    return rawChartData
-      .map((row, originalIdx) => {
-        // Skip if before display range
-        if (row.date < displayStartDate) return null;
+    // Filter current data to display range
+    const currentFiltered = rawChartData.filter(row => row.date >= displayStartDate);
 
-        const newRow: any = { date: row.date };
+    if (!hasPrior) {
+      // No prior periods — original logic with rolling averages
+      return rawChartData
+        .map((row, originalIdx) => {
+          if (row.date < displayStartDate) return null;
+
+          const newRow: any = { date: row.date };
+
+          selectedItems.forEach(item => {
+            if (selectedRollingAvgs.includes('raw')) {
+              newRow[item] = row[item];
+            }
+
+            selectedRollingAvgs.forEach(raKey => {
+              if (raKey === 'raw') return;
+              const raOption = rollingAverageOptions.find(o => o.key === raKey);
+              if (!raOption) return;
+
+              const avgValue = rollingAveragesData[item]?.[raKey]?.[originalIdx];
+              if (avgValue !== undefined) {
+                if (raOption.isMtd) {
+                  newRow[`${item}_mtd`] = avgValue;
+                } else {
+                  newRow[`${item}_${raKey}`] = avgValue;
+                }
+              }
+            });
+          });
+
+          return newRow;
+        })
+        .filter(Boolean);
+    }
+
+    // --- Prior period alignment mode ---
+    // Find the max length across all periods
+    const maxLen = Math.max(
+      currentFiltered.length,
+      ...priorChartDataSets.map(s => s.data.length)
+    );
+
+    const merged: any[] = [];
+    for (let i = 0; i < maxLen; i++) {
+      const posLabel = getPositionLabel(i, rangeType, displayDateRange.start);
+      const row: any = { positionLabel: posLabel };
+
+      // Add current period values (with rolling averages)
+      if (i < currentFiltered.length) {
+        row.date = currentFiltered[i].date;
+        // Find original index for rolling average lookup
+        const originalIdx = rawChartData.indexOf(currentFiltered[i]);
 
         selectedItems.forEach(item => {
-          // Add raw data if selected
           if (selectedRollingAvgs.includes('raw')) {
-            newRow[item] = row[item];
+            row[item] = currentFiltered[i][item];
           }
 
-          // Add pre-calculated rolling averages
           selectedRollingAvgs.forEach(raKey => {
             if (raKey === 'raw') return;
-
             const raOption = rollingAverageOptions.find(o => o.key === raKey);
             if (!raOption) return;
 
             const avgValue = rollingAveragesData[item]?.[raKey]?.[originalIdx];
             if (avgValue !== undefined) {
               if (raOption.isMtd) {
-                newRow[`${item}_mtd`] = avgValue;
+                row[`${item}_mtd`] = avgValue;
               } else {
-                newRow[`${item}_${raKey}`] = avgValue;
+                row[`${item}_${raKey}`] = avgValue;
               }
             }
           });
         });
+      }
 
-        return newRow;
-      })
-      .filter(Boolean);
-  }, [rawChartData, displayDateRange, selectedItems, selectedRollingAvgs, rollingAveragesData]);
+      // Add prior period values (raw only, no rolling averages for prior)
+      priorChartDataSets.forEach((pSet, pIdx) => {
+        if (i < pSet.data.length) {
+          selectedItems.forEach(item => {
+            row[`${item}_prior${pIdx + 1}`] = pSet.data[i][item];
+          });
+        }
+      });
 
-  // Generate series keys for chart based on selections
+      merged.push(row);
+    }
+
+    return merged;
+  }, [rawChartData, displayDateRange, selectedItems, selectedRollingAvgs, rollingAveragesData, priorPeriods, priorChartDataSets, rangeType]);
+
+  // Generate series keys for chart based on selections (including prior period keys)
   const chartSeriesKeys = useMemo(() => {
     const keys: string[] = [];
     selectedItems.forEach(item => {
@@ -465,8 +582,38 @@ export default function YieldReport() {
         }
       });
     });
+
+    // Add prior period keys
+    for (let p = 0; p < priorChartDataSets.length; p++) {
+      selectedItems.forEach(item => {
+        keys.push(`${item}_prior${p + 1}`);
+      });
+    }
+
     return keys;
-  }, [selectedItems, selectedRollingAvgs]);
+  }, [selectedItems, selectedRollingAvgs, priorChartDataSets]);
+
+  // Collect prior period key names for chart styling
+  const priorPeriodKeysList = useMemo(() => {
+    const keys: string[] = [];
+    for (let p = 0; p < priorChartDataSets.length; p++) {
+      selectedItems.forEach(item => {
+        keys.push(`${item}_prior${p + 1}`);
+      });
+    }
+    return keys;
+  }, [selectedItems, priorChartDataSets]);
+
+  // Series labels for prior period keys (human-readable)
+  const priorSeriesLabels = useMemo(() => {
+    const labels: Record<string, string> = {};
+    priorChartDataSets.forEach((pSet, pIdx) => {
+      selectedItems.forEach(item => {
+        labels[`${item}_prior${pIdx + 1}`] = `${item} (${pSet.label})`;
+      });
+    });
+    return labels;
+  }, [priorChartDataSets, selectedItems]);
 
   // Statistics for selected items (using raw data for stats)
   const stats = useMemo(() => {
@@ -756,11 +903,48 @@ export default function YieldReport() {
             )}
           </div>
 
-          {/* Bucket Selector */}
+          {/* Prior Period Overlay Selector */}
           <div>
             <label className="text-sm font-medium text-gray-700 mb-2 block">
-              Buckets ({selectedItems.filter(i => bucketMap[i]).length} selected)
+              Prior Periods
+              <span className="ml-2 text-xs text-gray-500 font-normal">
+                (overlay previous periods for comparison)
+              </span>
             </label>
+            <div className="flex flex-wrap gap-2">
+              {[0, 1, 2, 3].map((n) => (
+                <Button
+                  key={n}
+                  variant={priorPeriods === n ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setPriorPeriods(n)}
+                >
+                  {n === 0 ? 'None' : n}
+                </Button>
+              ))}
+            </div>
+            {priorPeriodRanges.length > 0 && (
+              <p className="text-xs text-gray-500 mt-2">
+                Overlaying: {priorPeriodRanges.map(p => p.label).join(', ')}
+              </p>
+            )}
+          </div>
+
+          {/* Bucket Selector */}
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <label className="text-sm font-medium text-gray-700">
+                Buckets ({selectedItems.filter(i => bucketMap[i]).length} selected)
+              </label>
+              {selectedItems.length > 0 && (
+                <button
+                  onClick={() => setSelectedItems([])}
+                  className="text-xs text-gray-500 hover:text-red-600 transition-colors"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
             <div className="flex flex-wrap gap-2">
               {selectableBuckets.map((item: string) => (
                 <Button
@@ -858,11 +1042,14 @@ export default function YieldReport() {
               ref={chartRef}
               data={finalChartData}
               seriesKeys={chartSeriesKeys}
+              seriesLabels={priorPeriods > 0 ? priorSeriesLabels : undefined}
               height={400}
               showDataZoom={finalChartData.length > 60}
               yAxisLabel={selectedMetric === 'yield_pct' ? 'Yield %' : yieldMetrics.find(m => m.key === selectedMetric)?.label}
               yAxisBounds={yAxisBounds}
               onYAxisBoundsChange={setYAxisBounds}
+              priorPeriodKeys={priorPeriodKeysList.length > 0 ? priorPeriodKeysList : undefined}
+              xAxisField={priorPeriods > 0 && priorChartDataSets.length > 0 ? 'positionLabel' : undefined}
             />
           ) : (
             <div className="h-[400px] flex items-center justify-center bg-gray-50 rounded-lg">

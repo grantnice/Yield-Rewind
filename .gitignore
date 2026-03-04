@@ -10,7 +10,7 @@ build/
 dist/
 
 # SQLite database
-data/
+/data/
 *.db
 *.db-shm
 *.db-wal
@@ -44,6 +44,11 @@ coverage/
 # TypeScript
 *.tsbuildinfo
 
+# Python
+__pycache__/
+*.pyc
+
 # Misc
 *.pem
 .vercel
+nul

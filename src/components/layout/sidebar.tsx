@@ -11,6 +11,7 @@ import {
   ShoppingCart,
   Droplets,
   Table,
+  Activity,
   Settings,
   RefreshCw,
   Shield,
@@ -25,6 +26,7 @@ const navigation = [
   { name: 'Sales Report', href: '/sales', icon: ShoppingCart },
   { name: 'Tank Inventory', href: '/tanks', icon: Droplets },
   { name: 'Monthly Yield', href: '/monthly-yield', icon: Table },
+  { name: 'Historian', href: '/historian', icon: Activity },
 ];
 
 const settingsNav = [

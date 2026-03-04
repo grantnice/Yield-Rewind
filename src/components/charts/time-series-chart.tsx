@@ -86,6 +86,9 @@ export interface TimeSeriesChartProps {
   secondaryAxisKeys?: string[]; // Series to show on right y-axis
   secondaryAxisLabel?: string;
   periodBoundaries?: PeriodBoundary[]; // Vertical lines marking period transitions
+  priorPeriodKeys?: string[]; // Series keys that are prior period overlays (e.g. "Jet_prior1")
+  xAxisField?: string; // Field to use for x-axis labels (default: "date")
+  seriesDecimals?: Record<string, number>; // Per-series decimal precision for tooltip (key → decimals)
 }
 
 export interface TimeSeriesChartRef {
@@ -110,6 +113,9 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   secondaryAxisKeys = [],
   secondaryAxisLabel,
   periodBoundaries = [],
+  priorPeriodKeys = [],
+  xAxisField,
+  seriesDecimals = {},
 }: TimeSeriesChartProps, ref) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstance = useRef<echarts.ECharts | null>(null);
@@ -203,15 +209,20 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   // Check if data spans multiple years
   const spansMultipleYears = useMemo(() => {
     if (!data || data.length < 2) return false;
-    // Parse year directly from string to avoid timezone issues
-    const firstYear = parseInt(data[0].date.split('-')[0], 10);
-    const lastYear = parseInt(data[data.length - 1].date.split('-')[0], 10);
+    // When using a custom x-axis field, date may not be present on all rows
+    const firstDate = data[0]?.date;
+    const lastDate = data[data.length - 1]?.date;
+    if (!firstDate || !lastDate) return false;
+    const firstYear = parseInt(firstDate.split('-')[0], 10);
+    const lastYear = parseInt(lastDate.split('-')[0], 10);
     return firstYear !== lastYear;
   }, [data]);
 
   // Format dates for display (include year if data spans multiple years)
   // Parse as local date to avoid timezone shift (YYYY-MM-DD gets parsed as UTC)
   const formatDate = useCallback((dateStr: string) => {
+    // If not a YYYY-MM-DD format (e.g. position labels), return as-is
+    if (!dateStr || !dateStr.match(/^\d{4}-\d{2}-\d{2}/)) return dateStr;
     // Split the date string to avoid UTC parsing issues
     const [year, month, day] = dateStr.split('-').map(Number);
     const date = new Date(year, month - 1, day); // month is 0-indexed
@@ -225,9 +236,19 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   const chartOptions = useMemo((): EChartsOption => {
     if (!data || data.length === 0) return {};
 
-    const dates = data.map((d) => d.date);
+    const dates = data.map((d) => (xAxisField && d[xAxisField] != null ? String(d[xAxisField]) : d.date));
 
     const hasSecondaryAxis = secondaryAxisKeys.length > 0;
+
+    // Build a map of prior period keys to their "prior level" (1, 2, or 3)
+    // and their base series key for color matching
+    const priorKeyInfo: Record<string, { level: number; baseKey: string }> = {};
+    priorPeriodKeys.forEach((pk) => {
+      const match = pk.match(/^(.+)_prior(\d+)$/);
+      if (match) {
+        priorKeyInfo[pk] = { level: parseInt(match[2], 10), baseKey: match[1] };
+      }
+    });
 
     const series: any[] = seriesKeys.map((key, index) => {
       const seriesData = data.map((d) => {
@@ -236,8 +257,20 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       });
 
       const isBar = chartType === 'bar';
-      const seriesColor = CHART_COLORS[index % CHART_COLORS.length];
       const isSecondary = secondaryAxisKeys.includes(key);
+
+      // For prior period keys, match the color of the base (current) series
+      const priorInfo = priorKeyInfo[key];
+      let seriesColor: string;
+      if (priorInfo) {
+        const baseIndex = seriesKeys.indexOf(priorInfo.baseKey);
+        seriesColor = CHART_COLORS[(baseIndex >= 0 ? baseIndex : index) % CHART_COLORS.length];
+      } else {
+        // For current series, only count non-prior keys for color index
+        const currentKeys = seriesKeys.filter(k => !priorKeyInfo[k]);
+        const currentIndex = currentKeys.indexOf(key);
+        seriesColor = CHART_COLORS[(currentIndex >= 0 ? currentIndex : index) % CHART_COLORS.length];
+      }
 
       // Find reference lines for this series
       const seriesRefLines = referenceLines.filter(
@@ -313,24 +346,41 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
         });
       }
 
+      // Prior period line styling
+      let lineStyle: any = isBar ? undefined : { width: 2 };
+      let itemOpacity = 1;
+      if (priorInfo && !isBar) {
+        const level = priorInfo.level;
+        if (level === 1) {
+          lineStyle = { width: 2, type: [4, 4] as number[], opacity: 0.7 };
+          itemOpacity = 0.7;
+        } else if (level === 2) {
+          lineStyle = { width: 2, type: [8, 4] as number[], opacity: 0.5 };
+          itemOpacity = 0.5;
+        } else {
+          lineStyle = { width: 1.5, type: [2, 2] as number[], opacity: 0.4 };
+          itemOpacity = 0.4;
+        }
+      }
+
       return {
         name: seriesLabels[key] || key,
         type: isBar ? 'bar' : 'line',
         data: seriesData,
         smooth: isBar ? undefined : smooth,
-        showSymbol: isBar ? undefined : data.length < 100,
+        showSymbol: isBar ? undefined : (priorInfo ? false : data.length < 100),
         symbolSize: isBar ? undefined : 4,
         color: seriesColor,
-        lineStyle: isBar ? undefined : { width: 2 },
-        areaStyle: chartType === 'area' ? { opacity: stacked ? 0.7 : 0.3 } : undefined,
-        stack: stacked ? 'total' : undefined,
+        lineStyle,
+        itemStyle: priorInfo ? { opacity: itemOpacity } : undefined,
+        areaStyle: chartType === 'area' && !priorInfo ? { opacity: stacked ? 0.7 : 0.3 } : undefined,
+        stack: stacked && !priorInfo ? 'total' : undefined,
         barMaxWidth: isBar ? 30 : undefined,
-        yAxisIndex: isSecondary ? 1 : 0, // Secondary series go to right y-axis
+        yAxisIndex: isSecondary ? 1 : 0,
         sampling: 'lttb',
         progressive: 200,
         animation: data.length < 500,
         animationDuration: 300,
-        // Add markLine for reference lines and period boundaries
         markLine: markLineData.length > 0 ? {
           silent: true,
           symbol: 'none',
@@ -356,24 +406,38 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
         textStyle: { color: '#374151' },
         formatter: (params: any) => {
           if (!Array.isArray(params)) return '';
-          const date = params[0]?.axisValue || '';
-          const items = params
+          const xLabel = params[0]?.axisValue || '';
+
+          // Group items: current series first, then prior periods
+          const currentItems: string[] = [];
+          const priorItems: string[] = [];
+
+          params
             .filter((p: any) => p.value != null && p.value !== 0)
-            .map((p: any) => {
-              // Check if this series is on the secondary axis (by matching series name)
+            .forEach((p: any) => {
               const seriesKey = seriesKeys.find(k => (seriesLabels[k] || k) === p.seriesName) || p.seriesName;
               const isSecondaryAxisSeries = secondaryAxisKeys.includes(seriesKey);
 
-              // Secondary axis series show as BBL, primary as percentage (if yAxisLabel includes %)
+              const dec = seriesDecimals[seriesKey];
               const formatted = isSecondaryAxisSeries
                 ? Math.round(p.value).toLocaleString() + ' BBL'
-                : yAxisLabel?.includes('%')
-                  ? p.value.toFixed(1) + '%'
-                  : Math.round(p.value).toLocaleString();
-              return `${p.marker} ${p.seriesName}: <strong>${formatted}</strong>`;
-            })
-            .join('<br/>');
-          return `<strong>${date}</strong><br/>${items}`;
+                : dec != null
+                  ? p.value.toFixed(dec)
+                  : yAxisLabel?.includes('%')
+                    ? p.value.toFixed(1) + '%'
+                    : Math.round(p.value).toLocaleString();
+
+              const line = `${p.marker} ${p.seriesName}: <strong>${formatted}</strong>`;
+
+              if (priorKeyInfo[seriesKey]) {
+                priorItems.push(line);
+              } else {
+                currentItems.push(line);
+              }
+            });
+
+          const allItems = [...currentItems, ...priorItems].join('<br/>');
+          return `<strong>${xLabel}</strong><br/>${allItems}`;
         },
       },
       legend: {
@@ -384,11 +448,11 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       xAxis: {
         type: 'category',
         data: dates,
-        boundaryGap: chartType === 'bar', // Bar charts need gap, line charts don't
+        boundaryGap: chartType === 'bar',
         axisLine: { show: false },
         axisTick: { show: false },
         axisLabel: {
-          formatter: formatDate,
+          formatter: xAxisField ? undefined : formatDate,
           color: '#9ca3af',
           interval: data.length > 90 ? Math.floor(data.length / 12) : 'auto',
         },
@@ -451,9 +515,16 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       },
       series,
     };
-  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines, secondaryAxisKeys, secondaryAxisLabel, periodBoundaries]);
+  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines, secondaryAxisKeys, secondaryAxisLabel, periodBoundaries, priorPeriodKeys, xAxisField, seriesDecimals]);
 
-  // Initialize chart
+  // Track whether the chart div is in the DOM (survives early return)
+  const [chartMounted, setChartMounted] = useState(false);
+  const chartCallbackRef = useCallback((node: HTMLDivElement | null) => {
+    (chartRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
+    setChartMounted(!!node);
+  }, []);
+
+  // Initialize chart — re-runs when the chart div appears in the DOM
   useEffect(() => {
     if (!chartRef.current) return;
 
@@ -475,8 +546,9 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
     return () => {
       resizeObserver.disconnect();
       chart.dispose();
+      chartInstance.current = null;
     };
-  }, []);
+  }, [chartMounted]);
 
   // Add click handler to chart container for y-axis clicks
   useEffect(() => {
@@ -522,7 +594,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
 
   return (
     <>
-      <div ref={chartRef} style={{ height, width: '100%' }} className="relative" />
+      <div ref={chartCallbackRef} style={{ height, width: '100%' }} className="relative" />
 
       {/* Y-Axis Bounds Popup */}
       {showYAxisPopup && (
