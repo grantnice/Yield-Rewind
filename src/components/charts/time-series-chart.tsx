@@ -85,6 +85,7 @@ export interface TimeSeriesChartProps {
   referenceLines?: ReferenceLineConfig[];
   secondaryAxisKeys?: string[]; // Series to show on right y-axis
   secondaryAxisLabel?: string;
+  autoFitKeys?: string[]; // Series that get their own hidden y-axis (auto-scaled independently)
   periodBoundaries?: PeriodBoundary[]; // Vertical lines marking period transitions
   priorPeriodKeys?: string[]; // Series keys that are prior period overlays (e.g. "Jet_prior1")
   xAxisField?: string; // Field to use for x-axis labels (default: "date")
@@ -112,6 +113,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
   referenceLines = [],
   secondaryAxisKeys = [],
   secondaryAxisLabel,
+  autoFitKeys = [],
   periodBoundaries = [],
   priorPeriodKeys = [],
   xAxisField,
@@ -220,16 +222,25 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
 
   // Format dates for display (include year if data spans multiple years)
   // Parse as local date to avoid timezone shift (YYYY-MM-DD gets parsed as UTC)
+  // Also handles sub-daily timestamps like 'YYYY-MM-DD HH:MM'
   const formatDate = useCallback((dateStr: string) => {
     // If not a YYYY-MM-DD format (e.g. position labels), return as-is
     if (!dateStr || !dateStr.match(/^\d{4}-\d{2}-\d{2}/)) return dateStr;
-    // Split the date string to avoid UTC parsing issues
-    const [year, month, day] = dateStr.split('-').map(Number);
+    // Split the date portion
+    const datePart = dateStr.substring(0, 10);
+    const timePart = dateStr.length > 10 ? dateStr.substring(11).trim() : '';
+    const [year, month, day] = datePart.split('-').map(Number);
     const date = new Date(year, month - 1, day); // month is 0-indexed
+    let label: string;
     if (spansMultipleYears) {
-      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
+      label = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
+    } else {
+      label = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     }
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    if (timePart) {
+      label += ` ${timePart}`;
+    }
+    return label;
   }, [spansMultipleYears]);
 
   // Build chart options
@@ -239,6 +250,13 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
     const dates = data.map((d) => (xAxisField && d[xAxisField] != null ? String(d[xAxisField]) : d.date));
 
     const hasSecondaryAxis = secondaryAxisKeys.length > 0;
+
+    // Build yAxisIndex map: left=0, right=1 (if exists), then auto-fit keys get 2,3,4...
+    const baseAxes = hasSecondaryAxis ? 2 : 1;
+    const autoFitAxisMap: Record<string, number> = {};
+    autoFitKeys.forEach((key, i) => {
+      autoFitAxisMap[key] = baseAxes + i;
+    });
 
     // Build a map of prior period keys to their "prior level" (1, 2, or 3)
     // and their base series key for color matching
@@ -376,7 +394,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
         areaStyle: chartType === 'area' && !priorInfo ? { opacity: stacked ? 0.7 : 0.3 } : undefined,
         stack: stacked && !priorInfo ? 'total' : undefined,
         barMaxWidth: isBar ? 30 : undefined,
-        yAxisIndex: isSecondary ? 1 : 0,
+        yAxisIndex: autoFitAxisMap[key] != null ? autoFitAxisMap[key] : isSecondary ? 1 : 0,
         sampling: 'lttb',
         progressive: 200,
         animation: data.length < 500,
@@ -457,49 +475,48 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
           interval: data.length > 90 ? Math.floor(data.length / 12) : 'auto',
         },
       },
-      yAxis: hasSecondaryAxis ? [
-        {
-          type: 'value',
-          name: yAxisLabel,
-          min: yAxisBounds?.min ?? undefined,
-          max: yAxisBounds?.max ?? undefined,
-          axisLine: { show: false },
-          axisTick: { show: false },
-          axisLabel: {
-            formatter: yAxisFormatter || ((value: number) => value.toLocaleString()),
-            color: '#9ca3af',
+      yAxis: (() => {
+        const axes: any[] = [
+          {
+            type: 'value',
+            name: yAxisLabel,
+            min: yAxisBounds?.min ?? undefined,
+            max: yAxisBounds?.max ?? undefined,
+            axisLine: { show: false },
+            axisTick: { show: false },
+            axisLabel: {
+              formatter: yAxisFormatter || ((value: number) => value.toLocaleString()),
+              color: '#9ca3af',
+            },
+            splitLine: { lineStyle: { color: '#d1d5db', type: 'dashed' } },
+            nameTextStyle: onYAxisBoundsChange ? { color: '#6b7280' } : undefined,
           },
-          splitLine: { lineStyle: { color: '#d1d5db', type: 'dashed' } },
-          nameTextStyle: onYAxisBoundsChange ? { color: '#6b7280' } : undefined,
-        },
-        {
-          type: 'value',
-          name: secondaryAxisLabel,
-          position: 'right',
-          axisLine: { show: false },
-          axisTick: { show: false },
-          axisLabel: {
-            formatter: (value: number) => value.toLocaleString(),
-            color: '#9ca3af',
-          },
-          splitLine: { show: false }, // Don't duplicate grid lines
-          nameTextStyle: { color: '#6b7280' },
-        },
-      ] : {
-        type: 'value',
-        name: yAxisLabel,
-        min: yAxisBounds?.min ?? undefined,
-        max: yAxisBounds?.max ?? undefined,
-        axisLine: { show: false },
-        axisTick: { show: false },
-        axisLabel: {
-          formatter: yAxisFormatter || ((value: number) => value.toLocaleString()),
-          color: '#9ca3af',
-        },
-        splitLine: { lineStyle: { color: '#d1d5db', type: 'dashed' } },
-        // Indicate clickable area with subtle style when callback exists
-        nameTextStyle: onYAxisBoundsChange ? { color: '#6b7280' } : undefined,
-      },
+        ];
+        if (hasSecondaryAxis) {
+          axes.push({
+            type: 'value',
+            name: secondaryAxisLabel,
+            position: 'right',
+            axisLine: { show: false },
+            axisTick: { show: false },
+            axisLabel: {
+              formatter: (value: number) => value.toLocaleString(),
+              color: '#9ca3af',
+            },
+            splitLine: { show: false },
+            nameTextStyle: { color: '#6b7280' },
+          });
+        }
+        // Hidden y-axes for auto-fit series (no labels, no lines, just auto-scale)
+        autoFitKeys.forEach(() => {
+          axes.push({
+            type: 'value',
+            show: false,
+            splitLine: { show: false },
+          });
+        });
+        return axes.length === 1 && autoFitKeys.length === 0 ? axes[0] : axes;
+      })(),
       dataZoom: showDataZoom
         ? [
             { type: 'inside', start: 0, end: 100, throttle: 100 },
@@ -515,7 +532,7 @@ export const TimeSeriesChart = memo(forwardRef<TimeSeriesChartRef, TimeSeriesCha
       },
       series,
     };
-  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines, secondaryAxisKeys, secondaryAxisLabel, periodBoundaries, priorPeriodKeys, xAxisField, seriesDecimals]);
+  }, [data, seriesKeys, seriesLabels, chartType, stacked, smooth, showDataZoom, yAxisLabel, yAxisFormatter, formatDate, yAxisBounds, onYAxisBoundsChange, referenceLines, secondaryAxisKeys, secondaryAxisLabel, autoFitKeys, periodBoundaries, priorPeriodKeys, xAxisField, seriesDecimals]);
 
   // Track whether the chart div is in the DOM (survives early return)
   const [chartMounted, setChartMounted] = useState(false);

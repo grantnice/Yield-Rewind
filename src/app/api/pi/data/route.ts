@@ -34,7 +34,7 @@ export async function GET(request: NextRequest) {
   if (timeSinceLast < MIN_INTERVAL_MS) {
     const waitMs = MIN_INTERVAL_MS - timeSinceLast;
     return NextResponse.json(
-      { error: `Rate limited. PI server protection: please wait ${Math.ceil(waitMs / 1000)}s before retrying.` },
+      { error: `Rate limited (app-side PI protection): please wait ${Math.ceil(waitMs / 1000)}s before retrying.` },
       { status: 429, headers: { 'Retry-After': String(Math.ceil(waitMs / 1000)) } }
     );
   }

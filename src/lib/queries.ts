@@ -399,7 +399,7 @@ export interface PITagConfig {
   interval: string;
   summary_type: string;
   unit: string | null;
-  y_axis: 'left' | 'right';
+  y_axis: 'left' | 'right' | 'auto';
   color: string | null;
   display_order: number;
   is_active: number;

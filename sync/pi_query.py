@@ -46,16 +46,35 @@ def get_client() -> PIWebAPIClient:
     return PIWebAPIClient(base_url, verify_ssl=verify_ssl)
 
 
-def normalize_timestamp(ts_str: str) -> str:
-    """Normalize a PI timestamp to YYYY-MM-DD local date."""
-    # PI returns ISO format like "2025-01-15T14:30:00Z" or "2025-01-15T14:30:00-06:00"
+def is_sub_daily(interval: str) -> bool:
+    """Check if an interval like '1h', '4h', '8h' is sub-daily."""
+    if not interval:
+        return False
+    interval = interval.strip().lower()
+    if interval.endswith('h'):
+        try:
+            hours = int(interval[:-1])
+            return hours < 24
+        except ValueError:
+            return False
+    return False
+
+
+def normalize_timestamp(ts_str: str, sub_daily: bool = False) -> str:
+    """Normalize a PI timestamp.
+
+    If sub_daily is True, preserves hour:minute as 'YYYY-MM-DD HH:MM'.
+    Otherwise returns just 'YYYY-MM-DD'.
+    """
     if not ts_str:
         return ''
-    # Strip the time portion — take just the date
+    if sub_daily and 'T' in ts_str:
+        # 'YYYY-MM-DDTHH:MM:SS...' → 'YYYY-MM-DD HH:MM'
+        return ts_str[:10] + ' ' + ts_str[11:16]
     return ts_str[:10]
 
 
-def extract_items(stream_data: dict) -> list:
+def extract_items(stream_data: dict, sub_daily: bool = False) -> list:
     """Extract value items from a PI stream response, normalizing timestamps."""
     items = stream_data.get('Items', [])
     result = []
@@ -73,7 +92,7 @@ def extract_items(stream_data: dict) -> list:
             continue
 
         result.append({
-            'timestamp': normalize_timestamp(ts),
+            'timestamp': normalize_timestamp(ts, sub_daily),
             'value': value,
             'good': good,
         })
@@ -182,6 +201,7 @@ def cmd_interpolated(client: PIWebAPIClient, args: dict) -> dict:
     if not webids:
         raise ValueError('webids list required')
 
+    sub_daily = is_sub_daily(interval)
     t0 = time.time()
     streams = client.get_bulk_interpolated_data(
         webids, start_time, end_time, interval,
@@ -192,7 +212,7 @@ def cmd_interpolated(client: PIWebAPIClient, args: dict) -> dict:
     tags = {}
     for wid in webids:
         stream = streams.get(wid, {})
-        items = extract_items(stream)
+        items = extract_items(stream, sub_daily)
         tags[wid] = {
             'name': stream.get('Name', ''),
             'web_id': wid,
@@ -218,6 +238,7 @@ def cmd_summary(client: PIWebAPIClient, args: dict) -> dict:
     if not webids:
         raise ValueError('webids list required')
 
+    sub_daily = is_sub_daily(interval)
     t0 = time.time()
 
     # StreamSets summary endpoint — not in PIWebAPIClient, call directly
@@ -259,7 +280,7 @@ def cmd_summary(client: PIWebAPIClient, args: dict) -> dict:
                 continue
 
             items.append({
-                'timestamp': normalize_timestamp(ts),
+                'timestamp': normalize_timestamp(ts, sub_daily),
                 'value': value,
                 'good': True,
             })

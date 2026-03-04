@@ -1,13 +1,13 @@
 'use client';
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { TimeSeriesChart, YAxisBounds } from '@/components/charts/time-series-chart';
 import { TagSearchDialog } from '@/components/historian/tag-search-dialog';
 import { getDaysAgo, getYesterday, getMonthStart } from '@/lib/utils';
-import { X, Plus, Settings2, Loader2, Activity, RefreshCw, Zap, Clock, Database, Trash2 } from 'lucide-react';
+import { X, Plus, Settings2, Loader2, Activity, RefreshCw, Zap, Clock, Database, Trash2, Download, AlertTriangle } from 'lucide-react';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -21,7 +21,7 @@ interface PITagConfig {
   interval: string;
   summary_type: string;
   unit: string | null;
-  y_axis: 'left' | 'right';
+  y_axis: 'left' | 'right' | 'auto';
   color: string | null;
   display_order: number;
   is_active: number;
@@ -76,6 +76,50 @@ const SEED_TAGS = [
 ];
 
 const FETCH_COOLDOWN_MS = 5000; // Match server-side rate limit
+
+// Data size warning thresholds
+const WARN_POINT_THRESHOLD = 50_000; // Show warning above this many estimated points
+
+/** Parse an interval string like "1d", "4h", "1h" into hours. */
+function parseIntervalHours(interval: string): number {
+  const match = interval.match(/^(\d+)(h|d|w)$/);
+  if (!match) return 24; // default 1d
+  const [, num, unit] = match;
+  const n = parseInt(num, 10);
+  if (unit === 'h') return n;
+  if (unit === 'd') return n * 24;
+  if (unit === 'w') return n * 168;
+  return 24;
+}
+
+/** Estimate total data points for a fetch. */
+function estimateFetchSize(
+  tags: { retrieval_mode: string; interval: string }[],
+  startDate: string,
+  endDate: string,
+): { total: number; recordedTags: number; recordedDays: number } {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)));
+
+  let total = 0;
+  let recordedTags = 0;
+
+  tags.forEach(tag => {
+    if (tag.retrieval_mode === 'recorded') {
+      // Recorded: PI sends ALL raw values. Assume ~6/min (10s scan) as worst case.
+      // pi_query.py aggregates to daily, but the server still transmits everything.
+      total += days * 8640; // 6/min * 60 * 24
+      recordedTags++;
+    } else {
+      // Summary/Interpolated: server returns exactly (days / interval) points
+      const intervalHours = parseIntervalHours(tag.interval);
+      total += Math.ceil(days * 24 / intervalHours);
+    }
+  });
+
+  return { total, recordedTags, recordedDays: days };
+}
 
 // ─── Rolling average helper ─────────────────────────────────
 
@@ -141,6 +185,7 @@ export default function HistorianPage() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [fetchSource, setFetchSource] = useState<'cache' | 'pi' | 'mixed' | null>(null);
   const [seeding, setSeeding] = useState(false);
+  const [fetchWarning, setFetchWarning] = useState<{ message: string; estimate: number } | null>(null);
 
   // ─── Compute display date range ───────────────────────────
   const dateRange = useMemo(() => {
@@ -177,8 +222,16 @@ export default function HistorianPage() {
   const piData: Record<string, PIDataTag> = piManualData;
   const hasPiData = Object.keys(piData).length > 0;
 
-  // Cooldown check
-  const isCoolingDown = Date.now() - lastFetchTime < FETCH_COOLDOWN_MS;
+  // Cooldown check — auto re-enables button after cooldown expires
+  const [isCoolingDown, setIsCoolingDown] = useState(false);
+  useEffect(() => {
+    if (lastFetchTime === 0) return;
+    setIsCoolingDown(true);
+    const remaining = FETCH_COOLDOWN_MS - (Date.now() - lastFetchTime);
+    if (remaining <= 0) { setIsCoolingDown(false); return; }
+    const timer = setTimeout(() => setIsCoolingDown(false), remaining);
+    return () => clearTimeout(timer);
+  }, [lastFetchTime]);
 
   // ─── Fetch buckets for overlay (local DB — auto-fetch OK) ─
   const { data: bucketsData } = useQuery({
@@ -205,19 +258,36 @@ export default function HistorianPage() {
   });
 
   // ─── Merge all data into chart format ─────────────────────
-  const { chartData, seriesKeys, seriesLabels, secondaryAxisKeys, seriesDecimals } = useMemo(() => {
+  const { chartData, seriesKeys, seriesLabels, secondaryAxisKeys, autoFitKeys, seriesDecimals } = useMemo(() => {
     const dateSet = new Set<string>();
     const seriesMap: Record<string, Record<string, number | null>> = {};
+
+    // Track which series use daily vs sub-daily timestamps
+    const dailySeries = new Set<string>();
+    const dailyValues: Record<string, Record<string, number>> = {}; // seriesKey → { YYYY-MM-DD → value }
+    let hasSubDaily = false;
 
     // 1. PI tag series
     tags.forEach(tag => {
       const stream = piData[tag.web_id];
       if (!stream) return;
       const seriesKey = `pi_${tag.tag_name}`;
+      const isSubDaily = stream.items.some(item => item.timestamp.length > 10);
+
+      if (isSubDaily) {
+        hasSubDaily = true;
+      } else {
+        dailySeries.add(seriesKey);
+        dailyValues[seriesKey] = {};
+      }
+
       stream.items.forEach(item => {
         dateSet.add(item.timestamp);
         if (!seriesMap[item.timestamp]) seriesMap[item.timestamp] = {};
         seriesMap[item.timestamp][seriesKey] = item.value;
+        if (!isSubDaily) {
+          dailyValues[seriesKey][item.timestamp] = item.value;
+        }
       });
     });
 
@@ -239,12 +309,16 @@ export default function HistorianPage() {
         selectedBuckets.forEach(bucketName => {
           const components = bucketProductMap[bucketName];
           const seriesKey = `yield_${bucketName}`;
+          dailySeries.add(seriesKey);
+          if (!dailyValues[seriesKey]) dailyValues[seriesKey] = {};
           if (components) {
-            seriesMap[date][seriesKey] = components.reduce(
-              (sum, prod) => sum + (products[prod] || 0), 0
-            );
+            const val = components.reduce((sum, prod) => sum + (products[prod] || 0), 0);
+            seriesMap[date][seriesKey] = val;
+            dailyValues[seriesKey][date] = val;
           } else {
-            seriesMap[date][seriesKey] = products[bucketName] || 0;
+            const val = products[bucketName] || 0;
+            seriesMap[date][seriesKey] = val;
+            dailyValues[seriesKey][date] = val;
           }
         });
       });
@@ -252,9 +326,27 @@ export default function HistorianPage() {
 
     const sortedDates = Array.from(dateSet).sort();
 
+    // 3. When mixing sub-daily and daily data, forward-fill daily values into sub-daily slots
+    if (hasSubDaily && dailySeries.size > 0) {
+      sortedDates.forEach(ts => {
+        if (ts.length <= 10) return; // skip pure daily entries
+        const dateOnly = ts.substring(0, 10);
+        if (!seriesMap[ts]) seriesMap[ts] = {};
+        dailySeries.forEach(seriesKey => {
+          if (seriesMap[ts][seriesKey] == null) {
+            const dailyVal = dailyValues[seriesKey]?.[dateOnly];
+            if (dailyVal != null) {
+              seriesMap[ts][seriesKey] = dailyVal;
+            }
+          }
+        });
+      });
+    }
+
     const keys: string[] = [];
     const labels: Record<string, string> = {};
     const secondary: string[] = [];
+    const autoFit: string[] = [];
     const decimalsMap: Record<string, number> = {};
 
     tags.forEach(tag => {
@@ -263,6 +355,7 @@ export default function HistorianPage() {
       const unit = tag.unit ? ` (${tag.unit})` : '';
       labels[key] = (tag.display_name || tag.tag_name) + unit;
       if (tag.y_axis === 'right') secondary.push(key);
+      else if (tag.y_axis === 'auto') autoFit.push(key);
       if (tag.decimals != null) decimalsMap[key] = tag.decimals;
     });
 
@@ -302,6 +395,7 @@ export default function HistorianPage() {
           allKeys.push(avgKey);
           labels[avgKey] = `${labels[baseKey]} ${opt.label} Avg`;
           if (secondary.includes(baseKey)) secondary.push(avgKey);
+          if (autoFit.includes(baseKey)) autoFit.push(avgKey);
           if (baseKey in decimalsMap) decimalsMap[avgKey] = decimalsMap[baseKey];
 
           const avgs = computeRollingAverage(baseValues, opt.days);
@@ -321,6 +415,7 @@ export default function HistorianPage() {
       seriesKeys: finalKeys,
       seriesLabels: labels,
       secondaryAxisKeys: secondary.filter(k => finalKeys.includes(k)),
+      autoFitKeys: autoFit.filter(k => finalKeys.includes(k)),
       seriesDecimals: decimalsMap,
     };
   }, [tags, piData, overlayYield, yieldData, selectedBuckets, yieldMetric, buckets, selectedRollingAvgs]);
@@ -331,6 +426,7 @@ export default function HistorianPage() {
     if (tags.length === 0 || piFetching) return;
     setFetchError(null);
     setFetchSource(null);
+    setFetchWarning(null);
     setLastFetchTime(Date.now());
     setPiFetching(true);
 
@@ -351,40 +447,46 @@ export default function HistorianPage() {
 
       for (const [key, groupTags] of groupEntries) {
         const [mode, interval, summaryType] = key.split('|');
+        const intervalIsSubDaily = interval.endsWith('h') && parseInt(interval) < 24;
 
-        // Step 1: Check cache for existing data
-        const tagNames = groupTags.map(t => t.tag_name);
-        const cacheParams = new URLSearchParams({
-          tag_names: tagNames.join(','),
-          start_date: dateRange.start,
-          end_date: dateRange.end,
-          mode,
-        });
-        const cacheRes = await fetch(`/api/pi/cache?${cacheParams}`);
-        const cacheData = cacheRes.ok ? await cacheRes.json() : { cached: [], allCached: false, missingDates: null };
-
-        // Build results from cache
-        const cachedByTag: Record<string, { timestamp: string; value: number; good: boolean }[]> = {};
-        (cacheData.cached || []).forEach((row: { tag_name: string; date: string; value: number; good: number }) => {
-          if (!cachedByTag[row.tag_name]) cachedByTag[row.tag_name] = [];
-          cachedByTag[row.tag_name].push({ timestamp: row.date, value: row.value, good: !!row.good });
-        });
-
-        if (Object.keys(cachedByTag).length > 0) usedCache = true;
-
-        // Step 2: If all data is cached, use it directly — no PI request needed
-        if (cacheData.allCached) {
-          groupTags.forEach(tag => {
-            results[tag.web_id] = {
-              name: tag.tag_name,
-              web_id: tag.web_id,
-              items: cachedByTag[tag.tag_name] || [],
-            };
+        // Step 1: Check cache for existing data (daily intervals only — sub-daily bypasses cache)
+        if (!intervalIsSubDaily) {
+          const tagNames = groupTags.map(t => t.tag_name);
+          const cacheParams = new URLSearchParams({
+            tag_names: tagNames.join(','),
+            start_date: dateRange.start,
+            end_date: dateRange.end,
+            mode,
           });
-          continue;
+          const cacheRes = await fetch(`/api/pi/cache?${cacheParams}`);
+          const cacheData = cacheRes.ok ? await cacheRes.json() : { cached: [], allCached: false, missingDates: null };
+
+          // Build results from cache
+          const cachedByTag: Record<string, { timestamp: string; value: number; good: boolean }[]> = {};
+          (cacheData.cached || []).forEach((row: { tag_name: string; date: string; value: number; good: number }) => {
+            if (!cachedByTag[row.tag_name]) cachedByTag[row.tag_name] = [];
+            cachedByTag[row.tag_name].push({ timestamp: row.date, value: row.value, good: !!row.good });
+          });
+
+          // Always store cached data in results first (PI data will overwrite if fetched)
+          if (Object.keys(cachedByTag).length > 0) {
+            usedCache = true;
+            groupTags.forEach(tag => {
+              results[tag.web_id] = {
+                name: tag.tag_name,
+                web_id: tag.web_id,
+                items: cachedByTag[tag.tag_name] || [],
+              };
+            });
+          }
+
+          // Step 2: If all data is cached, skip PI request
+          if (cacheData.allCached) {
+            continue;
+          }
         }
 
-        // Step 3: Query PI for ALL data (simpler than gap-filling individual dates)
+        // Step 3: Query PI for data
         const webids = groupTags.map(t => t.web_id).join(',');
         const piParams = new URLSearchParams({
           webids,
@@ -398,7 +500,13 @@ export default function HistorianPage() {
         const res = await fetch(`/api/pi/data?${piParams}`);
         if (!res.ok) {
           const err = await res.json().catch(() => ({ error: 'Request failed' }));
-          throw new Error(err.error || `PI data request failed (${res.status})`);
+          const msg = err.error || `PI data request failed (${res.status})`;
+          // On rate limit or other failure, keep whatever we have (cached or prior groups)
+          if (Object.keys(results).length > 0) {
+            setFetchError(`Some tags skipped: ${msg}`);
+            continue;
+          }
+          throw new Error(msg);
         }
         const data = await res.json();
         usedPi = true;
@@ -428,7 +536,8 @@ export default function HistorianPage() {
         }
 
         // Step 5: Write to cache (fire-and-forget, respects size limit server-side)
-        if (cacheRows.length > 0) {
+        // Skip cache writes for sub-daily data (cache uses daily date-based keys)
+        if (!intervalIsSubDaily && cacheRows.length > 0) {
           fetch('/api/pi/cache', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -436,9 +545,9 @@ export default function HistorianPage() {
           }).catch(() => {}); // Don't fail the fetch if caching fails
         }
 
-        // Small delay between group requests to be gentle on PI
+        // Delay between group requests must exceed the server-side rate limit (5s)
         if (groupEntries.length > 1) {
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, FETCH_COOLDOWN_MS + 500));
         }
       }
 
@@ -453,6 +562,29 @@ export default function HistorianPage() {
       setPiFetching(false);
     }
   }, [tags, piFetching, dateRange, queryClient]);
+
+  // Pre-check: estimate data size and warn if too large
+  const handleFetchClick = useCallback(() => {
+    if (tags.length === 0 || piFetching) return;
+    setFetchWarning(null);
+
+    const est = estimateFetchSize(tags, dateRange.start, dateRange.end);
+
+    if (est.total > WARN_POINT_THRESHOLD) {
+      const parts: string[] = [];
+      if (est.recordedTags > 0) {
+        parts.push(
+          `${est.recordedTags} tag${est.recordedTags > 1 ? 's' : ''} in Recorded mode over ${est.recordedDays} days — ` +
+          `PI must transmit all raw values before aggregating to daily. Consider switching to Summary mode.`
+        );
+      }
+      parts.push(`Estimated ~${est.total.toLocaleString()} raw data points from the PI server.`);
+      setFetchWarning({ message: parts.join(' '), estimate: est.total });
+      return;
+    }
+
+    handleFetchData();
+  }, [tags, piFetching, dateRange, handleFetchData]);
 
   const handleSeedTags = useCallback(async () => {
     setSeeding(true);
@@ -502,6 +634,27 @@ export default function HistorianPage() {
     await fetch('/api/pi/cache', { method: 'DELETE' });
     queryClient.invalidateQueries({ queryKey: ['pi-cache-stats'] });
   }, [queryClient]);
+
+  const handleDownloadCsv = useCallback(() => {
+    if (chartData.length === 0 || seriesKeys.length === 0) return;
+    const header = ['Date', ...seriesKeys.map(k => seriesLabels[k] || k)];
+    const rows = chartData.map(row => {
+      const date = (row as Record<string, unknown>).date as string;
+      const values = seriesKeys.map(k => {
+        const v = (row as Record<string, unknown>)[k];
+        return v != null ? String(v) : '';
+      });
+      return [date, ...values];
+    });
+    const csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `historian_${dateRange.start}_${dateRange.end}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [chartData, seriesKeys, seriesLabels, dateRange]);
 
   const toggleBucket = useCallback((bucketName: string) => {
     setSelectedBuckets(prev =>
@@ -568,7 +721,7 @@ export default function HistorianPage() {
           )}
 
           <Button
-            onClick={handleFetchData}
+            onClick={handleFetchClick}
             disabled={tags.length === 0 || piFetching || isCoolingDown}
             size="sm"
             className="gap-1.5"
@@ -580,13 +733,65 @@ export default function HistorianPage() {
             )}
             {piFetching ? 'Fetching...' : hasPiData ? 'Refresh PI Data' : 'Fetch PI Data'}
           </Button>
+
+          {chartData.length > 0 && (
+            <Button onClick={handleDownloadCsv} variant="outline" size="sm" className="gap-1.5" title="Download trend data as CSV">
+              <Download className="h-4 w-4" />
+              CSV
+            </Button>
+          )}
         </div>
       </div>
 
+      {/* Data size warning banner */}
+      {fetchWarning && (
+        <div className="bg-amber-50 border border-amber-300 rounded-md px-4 py-3 text-sm text-amber-800">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0 text-amber-500" />
+            <div className="flex-1">
+              <p className="font-medium">Large data request</p>
+              <p className="mt-1 text-xs text-amber-700">{fetchWarning.message}</p>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs border-amber-400 text-amber-700 hover:bg-amber-100"
+                  onClick={() => { setFetchWarning(null); handleFetchData(); }}
+                >
+                  Proceed Anyway
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs"
+                  onClick={() => setFetchWarning(null)}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Fetch error banner */}
       {fetchError && (
-        <div className="bg-red-50 border border-red-200 rounded-md px-4 py-2 text-sm text-red-700">
-          {fetchError}
+        <div className="bg-red-50 border border-red-200 rounded-md px-4 py-2 text-sm text-red-700 flex items-center justify-between gap-2">
+          <span>{fetchError}</span>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs border-red-300 text-red-600 hover:bg-red-100"
+              disabled={piFetching || isCoolingDown}
+              onClick={() => { setFetchError(null); handleFetchClick(); }}
+            >
+              {isCoolingDown ? 'Wait...' : 'Retry'}
+            </Button>
+            <button onClick={() => setFetchError(null)} className="text-red-400 hover:text-red-600">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -668,6 +873,7 @@ export default function HistorianPage() {
                     <span>{tag.display_name || tag.tag_name}</span>
                     <span className="text-gray-400 text-[10px]">
                       {tag.retrieval_mode === 'summary' ? 'avg' : tag.retrieval_mode === 'recorded' ? 'raw' : 'interp'}
+                      {tag.retrieval_mode !== 'recorded' && tag.interval !== '1d' ? `/${tag.interval}` : ''}
                     </span>
                     {tag.y_axis === 'right' && (
                       <span className="text-[10px] text-gray-400">R</span>
@@ -697,7 +903,7 @@ export default function HistorianPage() {
                           className="w-full px-2 py-1 text-sm border rounded"
                         />
                       </div>
-                      <div className="grid grid-cols-3 gap-2">
+                      <div className="grid grid-cols-2 gap-2">
                         <div>
                           <label className="text-xs text-gray-500">Mode</label>
                           <select
@@ -705,11 +911,29 @@ export default function HistorianPage() {
                             onChange={(e) => handleUpdateTag(tag.id, { retrieval_mode: e.target.value })}
                             className="w-full px-2 py-1 text-xs border rounded"
                           >
-                            <option value="summary">Summary</option>
-                            <option value="interpolated">Interp</option>
-                            <option value="recorded">Recorded</option>
+                            <option value="summary">Summary (Avg)</option>
+                            <option value="interpolated">Interpolated</option>
+                            <option value="recorded">Recorded (Raw)</option>
                           </select>
                         </div>
+                        <div>
+                          <label className="text-xs text-gray-500">Interval</label>
+                          <select
+                            defaultValue={tag.interval}
+                            onChange={(e) => handleUpdateTag(tag.id, { interval: e.target.value })}
+                            className="w-full px-2 py-1 text-xs border rounded"
+                            disabled={tag.retrieval_mode === 'recorded'}
+                            title={tag.retrieval_mode === 'recorded' ? 'Recorded mode returns raw values (no interval)' : ''}
+                          >
+                            <option value="1h">1 hour</option>
+                            <option value="4h">4 hours</option>
+                            <option value="8h">8 hours</option>
+                            <option value="1d">1 day</option>
+                            <option value="7d">1 week</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
                         <div>
                           <label className="text-xs text-gray-500">Y-Axis</label>
                           <select
@@ -719,6 +943,7 @@ export default function HistorianPage() {
                           >
                             <option value="left">Left</option>
                             <option value="right">Right</option>
+                            <option value="auto">Auto-fit</option>
                           </select>
                         </div>
                         <div>
@@ -737,6 +962,11 @@ export default function HistorianPage() {
                           </select>
                         </div>
                       </div>
+                      {tag.retrieval_mode === 'recorded' && (
+                        <p className="text-[10px] text-amber-600">
+                          Recorded mode pulls all raw values from PI. Use Summary for continuous tags.
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>
@@ -884,6 +1114,7 @@ export default function HistorianPage() {
               yAxisLabel={tags.length > 0 ? (tags[0].unit || 'Value') : 'Value'}
               secondaryAxisKeys={secondaryAxisKeys}
               secondaryAxisLabel={overlayYield && selectedBuckets.length > 0 ? 'Yield (BBL)' : undefined}
+              autoFitKeys={autoFitKeys}
               loading={piFetching}
               yAxisBounds={yAxisBounds}
               onYAxisBoundsChange={setYAxisBounds}
