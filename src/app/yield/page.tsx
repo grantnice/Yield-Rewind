@@ -29,7 +29,13 @@ const rollingAverageOptions = [
   { key: 'ra14', label: '14-Day Avg', days: 14 },
   { key: 'ra30', label: '30-Day Avg', days: 30 },
   { key: 'mtd_avg', label: 'MTD Avg', days: 0, isMtd: true },
+  { key: 'month_avg', label: 'Month Avg', days: 0, isMonthAvg: true },
 ];
+
+function getLastDayOfMonth(yearMonth: string): number {
+  const [year, month] = yearMonth.split('-').map(Number);
+  return new Date(year, month, 0).getDate();
+}
 
 // Yield metrics available for trending (inventory options at end)
 const yieldMetrics = [
@@ -221,7 +227,7 @@ export default function YieldReport() {
 
   // Calculate fetch date range (may need extra data for rolling averages)
   const fetchDateRange = useMemo(() => {
-    const needsMtdAvg = selectedRollingAvgs.includes('mtd_avg');
+    const needsMtdAvg = selectedRollingAvgs.includes('mtd_avg') || selectedRollingAvgs.includes('month_avg');
     const maxRollingDays = Math.max(
       ...selectedRollingAvgs
         .map(key => rollingAverageOptions.find(o => o.key === key)?.days || 0)
@@ -457,12 +463,124 @@ export default function YieldReport() {
             }
           });
           result[item]['mtd_avg'] = avgs;
+        } else if (raOption.isMonthAvg) {
+          // Month avg - flat line = total/days_in_month for complete months, MTD for current month
+          // First pass: calculate per-month totals and last data day
+          const monthTotals: Record<string, { sum: number; lastDay: number }> = {};
+          rawChartData.forEach((row, i) => {
+            const month = row.date.substring(0, 7);
+            const day = parseInt(row.date.substring(8, 10));
+            if (!monthTotals[month]) monthTotals[month] = { sum: 0, lastDay: 0 };
+            monthTotals[month].sum += values[i];
+            if (day > monthTotals[month].lastDay) monthTotals[month].lastDay = day;
+          });
+
+          // Months where we have data through the last calendar day are calendar-complete
+          const calendarCompleteMonths = new Set<string>();
+          Object.entries(monthTotals).forEach(([month, stats]) => {
+            if (stats.lastDay === getLastDayOfMonth(month)) {
+              calendarCompleteMonths.add(month);
+            }
+          });
+
+          // Second pass: assign values
+          const avgsMonthly: number[] = [];
+          let curMonth = '';
+          let runSum = 0;
+          let runCount = 0;
+
+          rawChartData.forEach((row, i) => {
+            const month = row.date.substring(0, 7);
+            if (month !== curMonth) {
+              curMonth = month;
+              runSum = 0;
+              runCount = 0;
+            }
+            runSum += values[i];
+            runCount++;
+
+            if (calendarCompleteMonths.has(month)) {
+              avgsMonthly[i] = monthTotals[month].sum / getLastDayOfMonth(month);
+            } else {
+              avgsMonthly[i] = runSum / runCount;
+            }
+          });
+          result[item]['month_avg'] = avgsMonthly;
         }
       });
     });
 
     return result;
   }, [rawChartData, selectedItems, selectedRollingAvgs, completeMonths]);
+
+  // Compute rolling averages for each prior period dataset
+  const priorRollingAveragesData = useMemo(() => {
+    return priorChartDataSets.map(pSet => {
+      const result: Record<string, Record<string, number[]>> = {};
+      selectedItems.forEach(item => {
+        result[item] = {};
+        const values = pSet.data.map(r => (typeof r[item] === 'number' ? r[item] : 0) as number);
+
+        selectedRollingAvgs.forEach(raKey => {
+          const raOption = rollingAverageOptions.find(o => o.key === raKey);
+          if (!raOption || raKey === 'raw') return;
+
+          if (raOption.days > 0) {
+            const days = raOption.days;
+            const avgs: number[] = [];
+            let windowSum = 0;
+            for (let i = 0; i < values.length; i++) {
+              windowSum += values[i];
+              if (i >= days) windowSum -= values[i - days];
+              if (i >= days - 1) avgs[i] = windowSum / days;
+            }
+            result[item][raKey] = avgs;
+          } else if (raOption.isMtd) {
+            const avgs: number[] = [];
+            let curMonth = '';
+            let monthSum = 0;
+            let monthCount = 0;
+            pSet.data.forEach((row, i) => {
+              const month = row.date.substring(0, 7);
+              if (month !== curMonth) { curMonth = month; monthSum = 0; monthCount = 0; }
+              monthSum += values[i];
+              monthCount++;
+              avgs[i] = monthSum / monthCount;
+            });
+            result[item]['mtd_avg'] = avgs;
+          } else if (raOption.isMonthAvg) {
+            const monthTotals: Record<string, { sum: number; lastDay: number }> = {};
+            pSet.data.forEach((row, i) => {
+              const month = row.date.substring(0, 7);
+              const day = parseInt(row.date.substring(8, 10));
+              if (!monthTotals[month]) monthTotals[month] = { sum: 0, lastDay: 0 };
+              monthTotals[month].sum += values[i];
+              if (day > monthTotals[month].lastDay) monthTotals[month].lastDay = day;
+            });
+            const calComplete = new Set<string>();
+            Object.entries(monthTotals).forEach(([month, stats]) => {
+              if (stats.lastDay === getLastDayOfMonth(month)) calComplete.add(month);
+            });
+            const avgs: number[] = [];
+            let curMonth = '';
+            let runSum = 0;
+            let runCount = 0;
+            pSet.data.forEach((row, i) => {
+              const month = row.date.substring(0, 7);
+              if (month !== curMonth) { curMonth = month; runSum = 0; runCount = 0; }
+              runSum += values[i];
+              runCount++;
+              avgs[i] = calComplete.has(month)
+                ? monthTotals[month].sum / getLastDayOfMonth(month)
+                : runSum / runCount;
+            });
+            result[item]['month_avg'] = avgs;
+          }
+        });
+      });
+      return result;
+    });
+  }, [priorChartDataSets, selectedItems, selectedRollingAvgs]);
 
   // Apply rolling averages and create final chart data (now O(n) lookup)
   // When prior periods are active, align by position and merge
@@ -497,6 +615,8 @@ export default function YieldReport() {
               if (avgValue !== undefined) {
                 if (raOption.isMtd) {
                   newRow[`${item}_mtd`] = avgValue;
+                } else if (raOption.isMonthAvg) {
+                  newRow[`${item}_month_avg`] = avgValue;
                 } else {
                   newRow[`${item}_${raKey}`] = avgValue;
                 }
@@ -549,11 +669,30 @@ export default function YieldReport() {
         });
       }
 
-      // Add prior period values (raw only, no rolling averages for prior)
+      // Add prior period values (with same rolling averages as current period)
       priorChartDataSets.forEach((pSet, pIdx) => {
         if (i < pSet.data.length) {
           selectedItems.forEach(item => {
-            row[`${item}_prior${pIdx + 1}`] = pSet.data[i][item];
+            if (selectedRollingAvgs.includes('raw')) {
+              row[`${item}_prior${pIdx + 1}`] = pSet.data[i][item];
+            }
+
+            selectedRollingAvgs.forEach(raKey => {
+              if (raKey === 'raw') return;
+              const raOption = rollingAverageOptions.find(o => o.key === raKey);
+              if (!raOption) return;
+
+              const avgValue = priorRollingAveragesData[pIdx]?.[item]?.[raKey]?.[i];
+              if (avgValue !== undefined) {
+                if (raOption.isMtd) {
+                  row[`${item}_prior${pIdx + 1}_mtd`] = avgValue;
+                } else if (raOption.isMonthAvg) {
+                  row[`${item}_prior${pIdx + 1}_month_avg`] = avgValue;
+                } else {
+                  row[`${item}_prior${pIdx + 1}_${raKey}`] = avgValue;
+                }
+              }
+            });
           });
         }
       });
@@ -562,7 +701,7 @@ export default function YieldReport() {
     }
 
     return merged;
-  }, [rawChartData, displayDateRange, selectedItems, selectedRollingAvgs, rollingAveragesData, priorPeriods, priorChartDataSets, rangeType]);
+  }, [rawChartData, displayDateRange, selectedItems, selectedRollingAvgs, rollingAveragesData, priorPeriods, priorChartDataSets, priorRollingAveragesData, rangeType]);
 
   // Generate series keys for chart based on selections (including prior period keys)
   const chartSeriesKeys = useMemo(() => {
@@ -576,6 +715,8 @@ export default function YieldReport() {
           const raOption = rollingAverageOptions.find(o => o.key === raKey);
           if (raOption?.isMtd) {
             keys.push(`${item}_mtd`);
+          } else if (raOption?.isMonthAvg) {
+            keys.push(`${item}_month_avg`);
           } else if (raOption?.days) {
             keys.push(`${item}_${raKey}`);
           }
@@ -583,10 +724,24 @@ export default function YieldReport() {
       });
     });
 
-    // Add prior period keys
+    // Add prior period keys (matching display options)
     for (let p = 0; p < priorChartDataSets.length; p++) {
       selectedItems.forEach(item => {
-        keys.push(`${item}_prior${p + 1}`);
+        if (selectedRollingAvgs.includes('raw')) {
+          keys.push(`${item}_prior${p + 1}`);
+        }
+        selectedRollingAvgs.forEach(raKey => {
+          if (raKey === 'raw') return;
+          const raOption = rollingAverageOptions.find(o => o.key === raKey);
+          if (!raOption) return;
+          if (raOption.isMtd) {
+            keys.push(`${item}_prior${p + 1}_mtd`);
+          } else if (raOption.isMonthAvg) {
+            keys.push(`${item}_prior${p + 1}_month_avg`);
+          } else if (raOption.days) {
+            keys.push(`${item}_prior${p + 1}_${raKey}`);
+          }
+        });
       });
     }
 
@@ -598,11 +753,19 @@ export default function YieldReport() {
     const keys: string[] = [];
     for (let p = 0; p < priorChartDataSets.length; p++) {
       selectedItems.forEach(item => {
-        keys.push(`${item}_prior${p + 1}`);
+        if (selectedRollingAvgs.includes('raw')) keys.push(`${item}_prior${p + 1}`);
+        selectedRollingAvgs.forEach(raKey => {
+          if (raKey === 'raw') return;
+          const raOption = rollingAverageOptions.find(o => o.key === raKey);
+          if (!raOption) return;
+          if (raOption.isMtd) keys.push(`${item}_prior${p + 1}_mtd`);
+          else if (raOption.isMonthAvg) keys.push(`${item}_prior${p + 1}_month_avg`);
+          else if (raOption.days) keys.push(`${item}_prior${p + 1}_${raKey}`);
+        });
       });
     }
     return keys;
-  }, [selectedItems, priorChartDataSets]);
+  }, [selectedItems, selectedRollingAvgs, priorChartDataSets]);
 
   // Series labels for prior period keys (human-readable)
   const priorSeriesLabels = useMemo(() => {
@@ -610,10 +773,23 @@ export default function YieldReport() {
     priorChartDataSets.forEach((pSet, pIdx) => {
       selectedItems.forEach(item => {
         labels[`${item}_prior${pIdx + 1}`] = `${item} (${pSet.label})`;
+        selectedRollingAvgs.forEach(raKey => {
+          if (raKey === 'raw') return;
+          const raOption = rollingAverageOptions.find(o => o.key === raKey);
+          if (!raOption) return;
+          const raLabel = raOption.label;
+          if (raOption.isMtd) {
+            labels[`${item}_prior${pIdx + 1}_mtd`] = `${item} ${raLabel} (${pSet.label})`;
+          } else if (raOption.isMonthAvg) {
+            labels[`${item}_prior${pIdx + 1}_month_avg`] = `${item} ${raLabel} (${pSet.label})`;
+          } else if (raOption.days) {
+            labels[`${item}_prior${pIdx + 1}_${raKey}`] = `${item} ${raLabel} (${pSet.label})`;
+          }
+        });
       });
     });
     return labels;
-  }, [priorChartDataSets, selectedItems]);
+  }, [priorChartDataSets, selectedItems, selectedRollingAvgs]);
 
   // Statistics for selected items (using raw data for stats)
   const stats = useMemo(() => {
