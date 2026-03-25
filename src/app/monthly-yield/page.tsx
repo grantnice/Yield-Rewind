@@ -229,7 +229,7 @@ export default function MonthlyYieldTable() {
 
   // Trend view state
   const [view, setView] = useState<'table' | 'trend'>('table');
-  const [trendMonths, setTrendMonths] = useState<6 | 12 | 24>(12);
+  const [trendMonths, setTrendMonths] = useState<6 | 12 | 24 | 'ytd'>(12);
   const [trendBuckets, setTrendBuckets] = useState<string[]>(['Crude Rate']);
 
   // Fetch periods configuration for the month
@@ -287,9 +287,12 @@ export default function MonthlyYieldTable() {
     enabled: selectedPeriod !== null,
   });
 
-  // Compute start month for trend query (N months back from current month)
+  // Compute start month for trend query (N months back from current month, or Jan of current year for YTD)
   const trendStartMonth = useMemo(() => {
     const now = new Date();
+    if (trendMonths === 'ytd') {
+      return `${now.getFullYear()}-01`;
+    }
     const startDate = new Date(now.getFullYear(), now.getMonth() - trendMonths + 1, 1);
     return `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}`;
   }, [trendMonths]);
@@ -1053,7 +1056,7 @@ export default function MonthlyYieldTable() {
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Range</span>
                   <div className="inline-flex bg-gray-100 rounded-lg p-0.5">
-                    {([6, 12, 24] as const).map(n => (
+                    {([6, 12, 24, 'ytd'] as const).map(n => (
                       <button
                         key={n}
                         onClick={() => setTrendMonths(n)}
@@ -1063,7 +1066,7 @@ export default function MonthlyYieldTable() {
                             : 'text-gray-600 hover:text-gray-900'
                         }`}
                       >
-                        {n}mo
+                        {n === 'ytd' ? 'YTD' : `${n}mo`}
                       </button>
                     ))}
                   </div>
