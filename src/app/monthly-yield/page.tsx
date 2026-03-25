@@ -231,6 +231,8 @@ export default function MonthlyYieldTable() {
   const [view, setView] = useState<'table' | 'trend'>('table');
   const [trendMonths, setTrendMonths] = useState<6 | 12 | 24 | 'ytd'>(12);
   const [trendBuckets, setTrendBuckets] = useState<string[]>(['Crude Rate']);
+  const [showMop, setShowMop] = useState(true);
+  const [showBp, setShowBp] = useState(true);
 
   // Fetch periods configuration for the month
   const { data: periodsData } = useQuery({
@@ -1099,8 +1101,28 @@ export default function MonthlyYieldTable() {
                 </div>
               </div>
 
-              <div className="text-xs text-gray-400 italic">
-                Solid = Actual · Dashed = MOP · Dotted = BP
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowMop(v => !v)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-all ${
+                    showMop
+                      ? 'bg-blue-50 border-blue-300 text-blue-700'
+                      : 'bg-white border-gray-200 text-gray-400 line-through'
+                  }`}
+                >
+                  MOP
+                </button>
+                <button
+                  onClick={() => setShowBp(v => !v)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-all ${
+                    showBp
+                      ? 'bg-purple-50 border-purple-300 text-purple-700'
+                      : 'bg-white border-gray-200 text-gray-400 line-through'
+                  }`}
+                >
+                  BP
+                </button>
+                <span className="text-xs text-gray-400 italic">Solid = Actual</span>
               </div>
             </div>
 
@@ -1112,6 +1134,8 @@ export default function MonthlyYieldTable() {
                 selectedBuckets={trendBuckets.filter((b: string) => trendData.buckets[b])}
                 height={460}
                 loading={trendLoading}
+                showMop={showMop}
+                showBp={showBp}
               />
             ) : trendLoading ? (
               <div className="h-[460px] flex items-center justify-center">

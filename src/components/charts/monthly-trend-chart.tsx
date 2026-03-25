@@ -18,6 +18,8 @@ interface MonthlyTrendChartProps {
   selectedBuckets: string[];
   height?: number;
   loading?: boolean;
+  showMop?: boolean;
+  showBp?: boolean;
 }
 
 /**
@@ -36,6 +38,8 @@ export function MonthlyTrendChart({
   selectedBuckets,
   height = 420,
   loading = false,
+  showMop = true,
+  showBp = true,
 }: MonthlyTrendChartProps) {
   const hasFeedstock = selectedBuckets.some(b => FEEDSTOCK_BUCKETS.has(b));
   const hasNonFeedstock = selectedBuckets.some(b => !FEEDSTOCK_BUCKETS.has(b));
@@ -58,8 +62,8 @@ export function MonthlyTrendChart({
         // MOP    → _prior1 (dashed, 70% opacity, same color as actual)
         // BP     → _prior2 (lighter dashed, 50% opacity, same color as actual)
         row[bucket] = bd.actuals[monthIdx] ?? null;
-        row[`${bucket}_prior1`] = bd.mop[monthIdx] ?? null;
-        row[`${bucket}_prior2`] = bd.bp[monthIdx] ?? null;
+        if (showMop) row[`${bucket}_prior1`] = bd.mop[monthIdx] ?? null;
+        if (showBp) row[`${bucket}_prior2`] = bd.bp[monthIdx] ?? null;
       }
       return row;
     });
@@ -71,20 +75,30 @@ export function MonthlyTrendChart({
 
     for (const bucket of selectedBuckets) {
       if (!buckets[bucket]) continue;
-      seriesKeys.push(bucket, `${bucket}_prior1`, `${bucket}_prior2`);
-      priorPeriodKeys.push(`${bucket}_prior1`, `${bucket}_prior2`);
+      seriesKeys.push(bucket);
       seriesLabels[bucket] = `${bucket} Actual`;
-      seriesLabels[`${bucket}_prior1`] = `${bucket} MOP`;
-      seriesLabels[`${bucket}_prior2`] = `${bucket} BP`;
+
+      if (showMop) {
+        seriesKeys.push(`${bucket}_prior1`);
+        priorPeriodKeys.push(`${bucket}_prior1`);
+        seriesLabels[`${bucket}_prior1`] = `${bucket} MOP`;
+      }
+      if (showBp) {
+        seriesKeys.push(`${bucket}_prior2`);
+        priorPeriodKeys.push(`${bucket}_prior2`);
+        seriesLabels[`${bucket}_prior2`] = `${bucket} BP`;
+      }
 
       // When mixing units, put feedstock series on the right axis
       if (mixedUnits && FEEDSTOCK_BUCKETS.has(bucket)) {
-        secondaryAxisKeys.push(bucket, `${bucket}_prior1`, `${bucket}_prior2`);
+        secondaryAxisKeys.push(bucket);
+        if (showMop) secondaryAxisKeys.push(`${bucket}_prior1`);
+        if (showBp) secondaryAxisKeys.push(`${bucket}_prior2`);
       }
     }
 
     return { data, seriesKeys, seriesLabels, priorPeriodKeys, secondaryAxisKeys };
-  }, [months, buckets, selectedBuckets, mixedUnits]);
+  }, [months, buckets, selectedBuckets, mixedUnits, showMop, showBp]);
 
   const yAxisLabel = !hasNonFeedstock ? 'BBL/day' : 'Yield %';
   const yAxisFormatter = !hasNonFeedstock
