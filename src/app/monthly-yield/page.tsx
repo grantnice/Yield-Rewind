@@ -5,9 +5,10 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { PeriodManagerModal } from '@/components/periods/period-manager-modal';
 import { PeriodTabs } from '@/components/periods/period-tabs';
 import { FreshnessBadge, PriorMonthStatus } from '@/components/audit/freshness-badge';
-import { Settings2, RefreshCw, ClipboardPaste, Download, Image } from 'lucide-react';
+import { Settings2, RefreshCw, ClipboardPaste, Download, Image, TrendingUp, TableIcon } from 'lucide-react';
 import html2canvas from 'html2canvas';
 import { PasteTargetsModal } from '@/components/targets/paste-targets-modal';
+import { MonthlyTrendChart } from '@/components/charts/monthly-trend-chart';
 
 // Get month options for the last 12 months (quick-access buttons)
 function getMonthOptions() {
@@ -226,6 +227,11 @@ export default function MonthlyYieldTable() {
   const [lpgExpanded, setLpgExpanded] = useState(false);
   const tableRef = useRef<HTMLDivElement>(null);
 
+  // Trend view state
+  const [view, setView] = useState<'table' | 'trend'>('table');
+  const [trendMonths, setTrendMonths] = useState<6 | 12 | 24>(12);
+  const [trendBuckets, setTrendBuckets] = useState<string[]>(['Crude Rate']);
+
   // Fetch periods configuration for the month
   const { data: periodsData } = useQuery({
     queryKey: ['periods', selectedMonth.value],
@@ -279,6 +285,29 @@ export default function MonthlyYieldTable() {
       return res.json();
     },
     enabled: selectedPeriod !== null,
+  });
+
+  // Compute start month for trend query (N months back from current month)
+  const trendStartMonth = useMemo(() => {
+    const now = new Date();
+    const startDate = new Date(now.getFullYear(), now.getMonth() - trendMonths + 1, 1);
+    return `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}`;
+  }, [trendMonths]);
+
+  const trendEndMonth = useMemo(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  }, []);
+
+  // Fetch trend data (only when in trend view)
+  const { data: trendData, isLoading: trendLoading } = useQuery({
+    queryKey: ['yield-monthly-trend', trendStartMonth, trendEndMonth],
+    queryFn: async () => {
+      const res = await fetch(`/api/yield/monthly?start=${trendStartMonth}&end=${trendEndMonth}`);
+      if (!res.ok) throw new Error('Failed to fetch trend data');
+      return res.json();
+    },
+    enabled: view === 'trend',
   });
 
   // Fetch trajectory data
@@ -786,6 +815,32 @@ export default function MonthlyYieldTable() {
             </p>
           </div>
 
+          {/* View Toggle */}
+          <div className="inline-flex bg-white border border-gray-200 rounded-lg p-1 shadow-sm">
+            <button
+              onClick={() => setView('table')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-all ${
+                view === 'table'
+                  ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-white shadow-sm shadow-amber-500/25'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+              }`}
+            >
+              <TableIcon className="h-3.5 w-3.5" />
+              Table
+            </button>
+            <button
+              onClick={() => setView('trend')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-all ${
+                view === 'trend'
+                  ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-white shadow-sm shadow-amber-500/25'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+              }`}
+            >
+              <TrendingUp className="h-3.5 w-3.5" />
+              Trend
+            </button>
+          </div>
+
           {/* Action Buttons */}
           <div className="flex items-center gap-3">
             {/* Refresh MTD Status */}
@@ -901,8 +956,8 @@ export default function MonthlyYieldTable() {
           </div>
         </div>
 
-        {/* Month Selector */}
-        <div className="mb-6 flex items-center justify-between">
+        {/* Month Selector — hidden in trend view */}
+        {view === 'table' && <div className="mb-6 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="inline-flex bg-white border border-gray-200 rounded-xl p-1 shadow-sm">
               {monthOptions.slice(0, 6).map((month, idx) => (
@@ -961,10 +1016,10 @@ export default function MonthlyYieldTable() {
               Configure Periods
             </button>
           </div>
-        </div>
+        </div>}
 
-        {/* Period Tabs (if periods exist) */}
-        {hasPeriods && (
+        {/* Period Tabs — hidden in trend view */}
+        {view === 'table' && hasPeriods && (
           <div className="mb-6">
             <PeriodTabs
               periods={periods}
@@ -974,8 +1029,8 @@ export default function MonthlyYieldTable() {
           </div>
         )}
 
-        {/* Meta Info */}
-        {mtdData?.meta && (
+        {/* Meta Info — hidden in trend view */}
+        {view === 'table' && mtdData?.meta && (
           <div className="flex items-center gap-6 mb-6 text-xs text-gray-500 font-mono-data uppercase tracking-wide">
             <FreshnessBadge dataType="yield" month={selectedMonth.value} />
             <span className="flex items-center gap-2">
@@ -988,8 +1043,90 @@ export default function MonthlyYieldTable() {
           </div>
         )}
 
-        {/* Legend */}
-        <div className="flex items-center gap-8 mb-6 text-xs">
+        {/* Trend View Panel */}
+        {view === 'trend' && (
+          <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xl shadow-gray-200/50 p-6">
+            {/* Trend controls */}
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-4">
+                {/* Time range selector */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Range</span>
+                  <div className="inline-flex bg-gray-100 rounded-lg p-0.5">
+                    {([6, 12, 24] as const).map(n => (
+                      <button
+                        key={n}
+                        onClick={() => setTrendMonths(n)}
+                        className={`px-3 py-1.5 text-sm font-medium rounded-md transition-all ${
+                          trendMonths === n
+                            ? 'bg-white text-gray-900 shadow-sm'
+                            : 'text-gray-600 hover:text-gray-900'
+                        }`}
+                      >
+                        {n}mo
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Bucket selector */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Bucket</span>
+                  <div className="flex flex-wrap gap-1">
+                    {(trendData?.buckets ? Object.keys(trendData.buckets) : ['Crude Rate', 'CBOB', 'Jet', 'ULSD', 'PBOB', 'Distillate', 'VGO', 'Base Oil', 'LPG', 'Loss', 'VTB']).map((bucket: string) => (
+                      <button
+                        key={bucket}
+                        onClick={() => {
+                          setTrendBuckets(prev =>
+                            prev.includes(bucket)
+                              ? prev.length > 1 ? prev.filter(b => b !== bucket) : prev
+                              : [...prev, bucket]
+                          );
+                        }}
+                        className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-all ${
+                          trendBuckets.includes(bucket)
+                            ? 'bg-amber-50 border-amber-300 text-amber-700'
+                            : 'bg-white border-gray-200 text-gray-600 hover:border-gray-300 hover:text-gray-900'
+                        }`}
+                      >
+                        {bucket}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="text-xs text-gray-400 italic">
+                Solid = Actual · Dashed = MOP · Dotted = BP
+              </div>
+            </div>
+
+            {/* Chart */}
+            {trendData ? (
+              <MonthlyTrendChart
+                months={trendData.months}
+                buckets={trendData.buckets}
+                selectedBuckets={trendBuckets.filter((b: string) => trendData.buckets[b])}
+                height={460}
+                loading={trendLoading}
+              />
+            ) : trendLoading ? (
+              <div className="h-[460px] flex items-center justify-center">
+                <div className="flex flex-col items-center gap-4">
+                  <div className="w-8 h-8 border-2 border-amber-200 border-t-amber-500 rounded-full animate-spin" />
+                  <p className="text-gray-500 text-sm">Loading trend data...</p>
+                </div>
+              </div>
+            ) : (
+              <div className="h-[460px] flex items-center justify-center">
+                <p className="text-gray-500 text-sm">No trend data available</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Legend — hidden in trend view */}
+        {view === 'table' && <div className="flex items-center gap-8 mb-6 text-xs">
           <div className="flex items-center gap-2">
             <div className="w-3 h-3 rounded-full bg-gradient-to-br from-emerald-400 to-emerald-600 shadow-md shadow-emerald-500/30" />
             <span className="text-gray-600">Above Target</span>
@@ -1002,10 +1139,10 @@ export default function MonthlyYieldTable() {
             <div className="w-3 h-3 rounded-full bg-gradient-to-br from-rose-400 to-rose-600 shadow-md shadow-rose-500/30" />
             <span className="text-gray-600">Below Target</span>
           </div>
-        </div>
+        </div>}
 
-        {/* Data Table */}
-        <div ref={tableRef} className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xl shadow-gray-200/50">
+        {/* Data Table — hidden in trend view */}
+        {view === 'table' && <div ref={tableRef} className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xl shadow-gray-200/50">
           {isLoading ? (
             <div className="h-[500px] flex items-center justify-center">
               <div className="flex flex-col items-center gap-4">
@@ -1400,10 +1537,10 @@ export default function MonthlyYieldTable() {
               </div>
             </div>
           )}
-        </div>
+        </div>}
 
-        {/* Trajectory Projection Section */}
-        <div className="mt-8">
+        {/* Trajectory Projection Section — hidden in trend view */}
+        {view === 'table' && <div className="mt-8">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
               <div className="w-2 h-8 bg-gradient-to-b from-blue-500 to-blue-600 rounded-full shadow-lg shadow-blue-500/30" />
@@ -1627,7 +1764,7 @@ export default function MonthlyYieldTable() {
           <div className="mt-4 text-xs text-gray-500">
             <span><strong className="text-gray-700">Projected EOM</strong> = MTD Total + (Recent Avg × Days Remaining) / Total Days</span>
           </div>
-        </div>
+        </div>}
 
         {/* Footer Info */}
         <div className="mt-6 flex items-center justify-between text-xs text-gray-500">
