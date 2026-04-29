@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { TimeSeriesChart, TimeSeriesChartRef, YAxisBounds } from '@/components/charts/time-series-chart';
 import { SPCChart, YAxisBounds as SPCYAxisBounds } from '@/components/charts/spc-chart';
 import { SPCControls, BaselineMode, MetricOption } from '@/components/charts/spc-controls';
+import { DistributionChart, BinMode, YAxisMode as DistYAxisMode } from '@/components/charts/distribution-chart';
 import { getDaysAgo, getYesterday, getMonthStart, formatNumber, calculatePriorPeriods, getPositionLabel, classifyRange } from '@/lib/utils';
 import type { PriorPeriodRange } from '@/lib/utils';
 import { ChevronDown, ChevronRight } from 'lucide-react';
@@ -192,6 +193,14 @@ export default function YieldReport() {
   const [spcBaselineDays, setSpcBaselineDays] = useState(30);
   const [spcEnabledRules, setSpcEnabledRules] = useState<number[]>([1, 2, 3, 4, 5, 6, 7, 8]);
   const [spcYAxisBounds, setSpcYAxisBounds] = useState<SPCYAxisBounds>({ min: null, max: null });
+
+  // Distribution state
+  const [showDistribution, setShowDistribution] = useState(false);
+  const [distBinMode, setDistBinMode] = useState<BinMode>('auto');
+  const [distBinCount, setDistBinCount] = useState(20);
+  const [distBinStepText, setDistBinStepText] = useState('500');
+  const [distCustomEdgesText, setDistCustomEdgesText] = useState('');
+  const [distYAxisMode, setDistYAxisMode] = useState<DistYAxisMode>('count');
 
   // SPC metric options
   const spcMetricOptions: MetricOption[] = [
@@ -816,6 +825,40 @@ export default function YieldReport() {
     }).filter(Boolean);
   }, [finalChartData, selectedItems]);
 
+  // Raw daily values per selected item, restricted to the display window — feeds the distribution chart
+  const distributionValues = useMemo(() => {
+    const out: Record<string, number[]> = {};
+    if (!finalChartData.length) return out;
+    selectedItems.forEach(item => {
+      const vals: number[] = [];
+      finalChartData.forEach((row: any) => {
+        const v = row[item];
+        if (typeof v === 'number' && Number.isFinite(v)) vals.push(v);
+      });
+      out[item] = vals;
+    });
+    return out;
+  }, [finalChartData, selectedItems]);
+
+  // Parse the step input
+  const distBinStep = useMemo(() => {
+    const n = parseFloat(distBinStepText);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  }, [distBinStepText]);
+
+  // Parse the custom-edges text input into an ascending number list
+  const distCustomEdges = useMemo(() => {
+    if (!distCustomEdgesText.trim()) return undefined;
+    const parts = distCustomEdgesText
+      .split(/[\s,]+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(Number)
+      .filter(n => Number.isFinite(n));
+    if (parts.length < 2) return undefined;
+    return parts.sort((a, b) => a - b);
+  }, [distCustomEdgesText]);
+
   // Prepare SPC data (calculate for any product and any metric from raw API data)
   const spcData = useMemo(() => {
     if (!data?.data || !spcSeries) return [];
@@ -1271,6 +1314,172 @@ export default function YieldReport() {
               </table>
             </div>
           </CardContent>
+        </Card>
+      )}
+
+      {/* Distribution Section */}
+      {finalChartData.length > 0 && selectedItems.length > 0 && (
+        <Card>
+          <CardHeader>
+            <button
+              onClick={() => setShowDistribution(!showDistribution)}
+              className="flex items-center gap-2 w-full text-left"
+            >
+              {showDistribution ? (
+                <ChevronDown className="h-5 w-5 text-gray-500" />
+              ) : (
+                <ChevronRight className="h-5 w-5 text-gray-500" />
+              )}
+              <CardTitle>Distribution</CardTitle>
+              {!showDistribution && (
+                <span className="text-sm font-normal text-gray-500 ml-2">
+                  Click to expand
+                </span>
+              )}
+            </button>
+          </CardHeader>
+          {showDistribution && (
+            <CardContent className="space-y-4">
+              <p className="text-xs text-gray-500">
+                Histogram of raw daily values per series over the selected date range.
+                Rolling averages and prior periods are excluded.
+              </p>
+
+              <div className="flex flex-wrap gap-6 items-end">
+                {/* Bin Mode */}
+                <div>
+                  <label className="text-sm font-medium text-gray-700 mb-2 block">Binning</label>
+                  <div className="flex gap-2">
+                    {([
+                      { key: 'auto', label: 'Auto' },
+                      { key: 'count', label: 'Fixed Count' },
+                      { key: 'step', label: 'Step Size' },
+                      { key: 'edges', label: 'Custom Edges' },
+                    ] as { key: BinMode; label: string }[]).map(opt => (
+                      <Button
+                        key={opt.key}
+                        variant={distBinMode === opt.key ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setDistBinMode(opt.key)}
+                      >
+                        {opt.label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Y-axis mode */}
+                <div>
+                  <label className="text-sm font-medium text-gray-700 mb-2 block">Y-Axis</label>
+                  <div className="flex gap-2">
+                    {([
+                      { key: 'count', label: 'Count' },
+                      { key: 'percent', label: 'Percent' },
+                    ] as { key: DistYAxisMode; label: string }[]).map(opt => (
+                      <Button
+                        key={opt.key}
+                        variant={distYAxisMode === opt.key ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setDistYAxisMode(opt.key)}
+                      >
+                        {opt.label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Bin count (fixed-count mode) */}
+                {distBinMode === 'count' && (
+                  <div>
+                    <label className="text-sm font-medium text-gray-700 mb-2 block">
+                      Bins: <span className="font-normal text-gray-500">{distBinCount}</span>
+                    </label>
+                    <input
+                      type="range"
+                      min={2}
+                      max={50}
+                      value={distBinCount}
+                      onChange={e => setDistBinCount(parseInt(e.target.value, 10))}
+                      className="w-48"
+                    />
+                  </div>
+                )}
+
+                {/* Step size (step mode) */}
+                {distBinMode === 'step' && (
+                  <div>
+                    <label className="text-sm font-medium text-gray-700 mb-2 block">
+                      Step Size
+                      <span className="ml-2 text-xs text-gray-500 font-normal">
+                        (edges align to multiples)
+                      </span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        step="any"
+                        value={distBinStepText}
+                        onChange={e => setDistBinStepText(e.target.value)}
+                        className="w-28 px-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                      />
+                      <div className="flex gap-1">
+                        {[100, 500, 1000, 5000].map(s => (
+                          <Button
+                            key={s}
+                            variant={distBinStepText === String(s) ? 'default' : 'outline'}
+                            size="sm"
+                            onClick={() => setDistBinStepText(String(s))}
+                          >
+                            {s}
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
+                    {!distBinStep && (
+                      <p className="text-xs text-amber-600 mt-1">Enter a positive number.</p>
+                    )}
+                  </div>
+                )}
+
+                {/* Custom edges (custom-edges mode) */}
+                {distBinMode === 'edges' && (
+                  <div className="flex-1 min-w-[280px]">
+                    <label className="text-sm font-medium text-gray-700 mb-2 block">
+                      Edges
+                      <span className="ml-2 text-xs text-gray-500 font-normal">
+                        (comma- or space-separated; values outside the range are dropped)
+                      </span>
+                    </label>
+                    <input
+                      type="text"
+                      value={distCustomEdgesText}
+                      onChange={e => setDistCustomEdgesText(e.target.value)}
+                      placeholder="e.g. 0, 100, 200, 500, 1000"
+                      className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    />
+                    {distBinMode === 'edges' && !distCustomEdges && (
+                      <p className="text-xs text-amber-600 mt-1">
+                        Enter at least 2 numeric edges to apply custom binning.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <DistributionChart
+                seriesValues={distributionValues}
+                seriesKeys={selectedItems}
+                binMode={distBinMode}
+                binCount={distBinCount}
+                binStep={distBinStep}
+                customEdges={distCustomEdges}
+                yAxisMode={distYAxisMode}
+                valueFormatter={selectedMetric === 'yield_pct' ? (v) => `${v.toFixed(1)}%` : undefined}
+                height={380}
+              />
+            </CardContent>
+          )}
         </Card>
       )}
 
